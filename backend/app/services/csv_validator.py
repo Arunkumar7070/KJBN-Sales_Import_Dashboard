@@ -6,6 +6,9 @@ both accepted. Columns may appear in any order; rows are mapped by header name.
 Only a file that passes every check gets the SHA-256 hash of its original bytes.
 Row values and business rules are handled elsewhere.
 
+The command line also records a QUEUED import batch for a valid file, or
+reports that the same file (same hash) was already uploaded.
+
 Usage (from backend/):
     python -m app.services.csv_validator sales.csv
 """
@@ -14,12 +17,21 @@ import argparse
 import csv
 import hashlib
 import io
+import logging
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import Session
+
 from app.config import get_settings
+from app.database import SessionLocal
+from app.models import ImportBatch
+
+logger = logging.getLogger(__name__)
 
 REQUIRED_HEADERS = (
     "transaction_id",
@@ -176,6 +188,64 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(f"{result.sha256}  {result.path}")
+    return record_batch(result)
+
+
+@dataclass(frozen=True)
+class BatchRegistration:
+    batch: ImportBatch
+    is_new: bool
+
+
+def register_import_batch(
+    session: Session, filename: str, file_sha256: str
+) -> BatchRegistration:
+    """Create a QUEUED batch, or return the existing batch for the same file hash.
+
+    Duplicates are detected by the unique constraint on file_sha256, not by a
+    lookup first, so two simultaneous uploads of the same file cannot both
+    create a batch. The caller owns the transaction and must commit.
+    """
+    batch = ImportBatch(filename=filename, file_sha256=file_sha256, status="QUEUED")
+    try:
+        with session.begin_nested():
+            session.add(batch)
+    except IntegrityError:
+        existing = session.scalar(
+            select(ImportBatch).where(ImportBatch.file_sha256 == file_sha256)
+        )
+        if existing is None:
+            raise  # Some other constraint failed; not a duplicate upload.
+        return BatchRegistration(existing, is_new=False)
+    return BatchRegistration(batch, is_new=True)
+
+
+def record_batch(result: FileCheckResult) -> int:
+    try:
+        with SessionLocal() as session:
+            registration = register_import_batch(
+                session, filename=result.path.name, file_sha256=result.sha256
+            )
+            session.commit()
+    except SQLAlchemyError:
+        logger.exception("Could not record import batch for %s", result.path)
+        print(
+            f"ERROR {result.path}: could not record the import batch "
+            "(database unavailable).",
+            file=sys.stderr,
+        )
+        return 1
+
+    batch = registration.batch
+    if not registration.is_new:
+        print(
+            f"ALREADY UPLOADED {result.path}: this file was already uploaded as "
+            f"'{batch.filename}' (batch {batch.id}, status {batch.status}).",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"Created import batch {batch.id} with status {batch.status}.")
     return 0
 
 

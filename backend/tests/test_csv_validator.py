@@ -2,9 +2,19 @@ import hashlib
 import os
 
 import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.orm import sessionmaker
 
 from app.config import Settings
-from app.services.csv_validator import check_csv_file, main
+from app.database import Base
+from app.models import ImportBatch
+from app.services import csv_validator
+from app.services.csv_validator import (
+    check_csv_file,
+    main,
+    register_import_batch,
+)
 
 MAX_SIZE_BYTES = 1000
 UTF8_BOM = b"\xef\xbb\xbf"
@@ -35,6 +45,29 @@ ROW = [
     "",
 ]
 EXPECTED_ROW = dict(zip(HEADER, ROW, strict=True))
+
+
+@pytest.fixture(autouse=True)
+def session_factory(monkeypatch):
+    """Point the validator at a throwaway SQLite database; Neon is never touched."""
+    # autocommit=False makes sqlite3 handle SAVEPOINTs the way SQLAlchemy expects.
+    engine = create_engine("sqlite://", connect_args={"autocommit": False})
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(csv_validator, "SessionLocal", factory)
+    yield factory
+    engine.dispose()
+
+
+def all_batches(session_factory):
+    with session_factory() as session:
+        return session.scalars(select(ImportBatch)).all()
+
+
+def only_batch(session_factory):
+    batches = all_batches(session_factory)
+    assert len(batches) == 1
+    return batches[0]
 
 
 def csv_bytes(header=HEADER, rows=(ROW,), newline="\n"):
@@ -370,14 +403,18 @@ def test_hash_differs_for_crlf_and_lf_versions(tmp_path):
 # Command line
 
 
-def test_cli_prints_hash_for_valid_file(tmp_path, capsys):
+def test_cli_prints_hash_for_valid_file(tmp_path, capsys, session_factory):
     path = write_file(tmp_path, "sales.csv")
 
     exit_code = main([str(path)])
 
     output = capsys.readouterr()
+    batch = only_batch(session_factory)
     assert exit_code == 0
-    assert output.out == f"{hashlib.sha256(VALID_CONTENT).hexdigest()}  {path}\n"
+    assert output.out == (
+        f"{hashlib.sha256(VALID_CONTENT).hexdigest()}  {path}\n"
+        f"Created import batch {batch.id} with status QUEUED.\n"
+    )
     assert output.err == ""
 
 
@@ -418,3 +455,105 @@ def test_cli_requires_exactly_one_path(argv):
         main(argv)
 
     assert excinfo.value.code == 2
+
+
+# Import batch registration
+
+HASH_A = "a" * 64
+HASH_B = "b" * 64
+
+
+def test_new_hash_creates_queued_batch(session_factory):
+    with session_factory() as session:
+        registration = register_import_batch(session, "sales.csv", HASH_A)
+        session.commit()
+
+    batch = only_batch(session_factory)
+    assert registration.is_new is True
+    assert registration.batch.id == batch.id
+    assert (batch.filename, batch.file_sha256, batch.status) == (
+        "sales.csv",
+        HASH_A,
+        "QUEUED",
+    )
+
+
+def test_same_hash_returns_existing_batch_without_creating_another(session_factory):
+    with session_factory() as session:
+        first = register_import_batch(session, "sales.csv", HASH_A)
+        session.commit()
+
+    with session_factory() as session:
+        second = register_import_batch(session, "renamed copy.csv", HASH_A)
+        session.commit()
+
+    batch = only_batch(session_factory)
+    assert second.is_new is False
+    assert second.batch.id == first.batch.id == batch.id
+    assert batch.filename == "sales.csv"
+
+
+def test_session_stays_usable_after_a_duplicate(session_factory):
+    with session_factory() as session:
+        register_import_batch(session, "a.csv", HASH_A)
+        duplicate = register_import_batch(session, "a-again.csv", HASH_A)
+        other = register_import_batch(session, "b.csv", HASH_B)
+        session.commit()
+
+    assert duplicate.is_new is False
+    assert other.is_new is True
+    assert sorted(b.file_sha256 for b in all_batches(session_factory)) == [
+        HASH_A,
+        HASH_B,
+    ]
+
+
+def test_other_integrity_errors_are_not_reported_as_duplicates(session_factory):
+    with session_factory() as session, pytest.raises(IntegrityError):
+        register_import_batch(session, None, HASH_A)
+
+    assert all_batches(session_factory) == []
+
+
+# Command line + database
+
+
+def test_cli_reports_already_uploaded_file(tmp_path, capsys, session_factory):
+    original = write_file(tmp_path, "sales.csv")
+    copy = write_file(tmp_path, "copy.csv")
+    assert main([str(original)]) == 0
+    batch = only_batch(session_factory)
+    capsys.readouterr()
+
+    exit_code = main([str(copy)])
+
+    output = capsys.readouterr()
+    assert exit_code == 1
+    assert output.err == (
+        f"ALREADY UPLOADED {copy}: this file was already uploaded as "
+        f"'sales.csv' (batch {batch.id}, status QUEUED).\n"
+    )
+    assert only_batch(session_factory).id == batch.id
+
+
+def test_cli_creates_no_batch_for_invalid_file(tmp_path, session_factory):
+    path = write_file(tmp_path, "sales.csv", csv_bytes(header=HEADER[:-1]))
+
+    assert main([str(path)]) == 1
+    assert all_batches(session_factory) == []
+
+
+def test_cli_reports_database_failure_cleanly(tmp_path, capsys, monkeypatch):
+    def unavailable():
+        raise OperationalError("connect", {}, Exception("password=secret"))
+
+    monkeypatch.setattr(csv_validator, "SessionLocal", unavailable)
+    path = write_file(tmp_path, "sales.csv")
+
+    exit_code = main([str(path)])
+
+    err = capsys.readouterr().err
+    assert exit_code == 1
+    assert err == (
+        f"ERROR {path}: could not record the import batch (database unavailable).\n"
+    )
