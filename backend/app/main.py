@@ -1,5 +1,13 @@
+import logging
+from typing import Annotated
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, status
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from app.database import check_database_connection, get_db
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="KJBN Sales Dashboard API",
@@ -14,3 +22,16 @@ def health_check():
         "status": "Ok",
         "message": "Health Checking",
     }
+
+
+@app.get("/health/db", tags=["Health"])
+def database_health_check(db: Annotated[Session, Depends(get_db)]):
+    try:
+        check_database_connection(db)
+    except SQLAlchemyError:
+        logger.exception("Database health check failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable",
+        )
+    return {"status": "Ok", "database": "connected"}
