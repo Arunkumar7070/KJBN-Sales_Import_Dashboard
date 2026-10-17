@@ -1,9 +1,10 @@
+import hashlib
 import os
 
 import pytest
 
 from app.config import Settings
-from app.csv_validator import check_csv_file, check_csv_files
+from app.services.csv_validator import check_csv_file, main
 
 MAX_SIZE_BYTES = 1000
 UTF8_BOM = b"\xef\xbb\xbf"
@@ -59,6 +60,7 @@ def assert_invalid(result, expected_message):
     assert result.is_valid is False
     assert result.message == expected_message
     assert result.rows == ()
+    assert result.sha256 is None
 
 
 # Basic file checks
@@ -71,7 +73,7 @@ def test_valid_csv_passes(tmp_path, name):
     result = check_csv_file(path, MAX_SIZE_BYTES)
 
     assert result.is_valid is True
-    assert result.message == "File passed basic checks."
+    assert result.message == "File passed all checks."
     assert result.path == path
 
 
@@ -129,20 +131,6 @@ def test_unreadable_file_fails(tmp_path):
         path.chmod(0o600)
 
     assert_invalid(result, "File cannot be read (Permission denied).")
-
-
-def test_each_file_gets_its_own_result(tmp_path):
-    valid = write_file(tmp_path, "valid.csv")
-    empty = write_file(tmp_path, "empty.csv", b"")
-    missing = tmp_path / "missing.csv"
-
-    results = check_csv_files([valid, empty, missing], MAX_SIZE_BYTES)
-
-    assert [(result.path, result.is_valid) for result in results] == [
-        (valid, True),
-        (empty, False),
-        (missing, False),
-    ]
 
 
 def test_size_limit_setting_has_default_and_rejects_non_positive_values():
@@ -351,3 +339,82 @@ def test_bad_header_rejects_whole_file_even_with_valid_rows(tmp_path):
 
     assert result.is_valid is False
     assert result.rows == ()
+
+
+# SHA-256 hash
+
+
+def test_valid_file_hash_matches_original_bytes(tmp_path):
+    result = check(tmp_path, VALID_CONTENT)
+
+    assert result.sha256 == hashlib.sha256(VALID_CONTENT).hexdigest()
+
+
+def test_hash_covers_bom_bytes(tmp_path):
+    with_bom = UTF8_BOM + VALID_CONTENT
+
+    result = check(tmp_path, with_bom)
+
+    assert result.sha256 == hashlib.sha256(with_bom).hexdigest()
+    assert result.sha256 != hashlib.sha256(VALID_CONTENT).hexdigest()
+
+
+def test_hash_differs_for_crlf_and_lf_versions(tmp_path):
+    lf = check(tmp_path, csv_bytes(newline="\n"))
+    crlf = check(tmp_path, csv_bytes(newline="\r\n"))
+
+    assert lf.rows == crlf.rows
+    assert lf.sha256 != crlf.sha256
+
+
+# Command line
+
+
+def test_cli_prints_hash_for_valid_file(tmp_path, capsys):
+    path = write_file(tmp_path, "sales.csv")
+
+    exit_code = main([str(path)])
+
+    output = capsys.readouterr()
+    assert exit_code == 0
+    assert output.out == f"{hashlib.sha256(VALID_CONTENT).hexdigest()}  {path}\n"
+    assert output.err == ""
+
+
+@pytest.mark.parametrize(
+    ("name", "content", "expected_message"),
+    [
+        ("sales.txt", VALID_CONTENT, "File must have a .csv extension."),
+        ("sales.csv", b"", "File is empty."),
+        ("sales.csv", HEADER_LINE + b"\xff", "File is not valid UTF-8"),
+        ("sales.csv", HEADER_LINE + b'"unterminated\n', "Malformed CSV near line 2"),
+        ("sales.csv", csv_bytes(header=HEADER[:-1]), "Invalid header"),
+    ],
+    ids=["extension", "empty", "encoding", "syntax", "header"],
+)
+def test_cli_rejects_invalid_file_without_hash(
+    tmp_path, capsys, name, content, expected_message
+):
+    path = write_file(tmp_path, name, content)
+
+    exit_code = main([str(path)])
+
+    output = capsys.readouterr()
+    assert exit_code == 1
+    assert output.out == ""
+    assert output.err.startswith(f"INVALID {path}: {expected_message}")
+
+
+def test_cli_rejects_missing_file(tmp_path, capsys):
+    path = tmp_path / "missing.csv"
+
+    assert main([str(path)]) == 1
+    assert capsys.readouterr().err == f"INVALID {path}: File does not exist.\n"
+
+
+@pytest.mark.parametrize("argv", [[], ["a.csv", "b.csv"]], ids=["none", "two"])
+def test_cli_requires_exactly_one_path(argv):
+    with pytest.raises(SystemExit) as excinfo:
+        main(argv)
+
+    assert excinfo.value.code == 2

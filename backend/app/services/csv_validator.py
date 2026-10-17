@@ -3,14 +3,23 @@
 Checks existence, extension, size, readability, UTF-8 encoding (an optional
 BOM is allowed), CSV syntax and the header row. LF and CRLF line endings are
 both accepted. Columns may appear in any order; rows are mapped by header name.
-Row values, hashing and business rules are handled elsewhere.
+Only a file that passes every check gets the SHA-256 hash of its original bytes.
+Row values and business rules are handled elsewhere.
+
+Usage (from backend/):
+    python -m app.services.csv_validator sales.csv
 """
 
+import argparse
 import csv
+import hashlib
 import io
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+
+from app.config import get_settings
 
 REQUIRED_HEADERS = (
     "transaction_id",
@@ -33,6 +42,8 @@ class FileCheckResult:
     message: str
     # Data rows keyed by header name; empty unless the file is valid.
     rows: tuple[dict, ...] = ()
+    # SHA-256 of the original file bytes (BOM included); None unless valid.
+    sha256: str | None = None
 
 
 class CsvFileError(Exception):
@@ -47,12 +58,12 @@ def check_csv_file(path: Path, max_size_bytes: int) -> FileCheckResult:
     except CsvFileError as error:
         return FileCheckResult(path, is_valid=False, message=str(error))
     return FileCheckResult(
-        path, is_valid=True, message="File passed basic checks.", rows=rows
+        path,
+        is_valid=True,
+        message="File passed all checks.",
+        rows=rows,
+        sha256=hashlib.sha256(content).hexdigest(),
     )
-
-
-def check_csv_files(paths: list[Path], max_size_bytes: int) -> list[FileCheckResult]:
-    return [check_csv_file(path, max_size_bytes) for path in paths]
 
 
 def read_file(path: Path, max_size_bytes: int) -> bytes:
@@ -150,3 +161,23 @@ def describe_unexpected(name: str) -> str:
     if normalized in REQUIRED_HEADERS:
         return f"'{name}' (expected '{normalized}')"
     return f"'{name}'"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Validate a sales CSV file and print its SHA-256 hash."
+    )
+    parser.add_argument("path", type=Path, help="CSV file path")
+    args = parser.parse_args(argv)
+
+    result = check_csv_file(args.path, get_settings().max_upload_size_bytes)
+    if not result.is_valid:
+        print(f"INVALID {result.path}: {result.message}", file=sys.stderr)
+        return 1
+
+    print(f"{result.sha256}  {result.path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
