@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -9,6 +9,7 @@ class Settings(BaseSettings):
 
     database_url: str
     app_env: str = "development"
+    max_upload_size_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
 
     @field_validator("database_url")
     @classmethod
