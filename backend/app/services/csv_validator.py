@@ -47,13 +47,35 @@ REQUIRED_HEADERS = (
 )
 
 
+OPTIONAL_FIELDS = frozenset({"original_transaction_id"})  # only set on returns
+# Stored as column_name for problems with the row as a whole, not one field.
+WHOLE_ROW = "__row__"
+
+
+@dataclass(frozen=True)
+class CsvRow:
+    # CSV row number as a spreadsheet shows it: the header is row 1.
+    row_number: int
+    values: dict[str, str]
+
+
+@dataclass(frozen=True)
+class RowError:
+    row_number: int
+    column_name: str
+    message: str
+    transaction_id: str | None = None
+
+
 @dataclass(frozen=True)
 class FileCheckResult:
     path: Path
     is_valid: bool
     message: str
-    # Data rows keyed by header name; empty unless the file is valid.
-    rows: tuple[dict, ...] = ()
+    # Rows that passed row checks; empty unless the file is valid.
+    rows: tuple[CsvRow, ...] = ()
+    # Rows that failed row checks; they do not make the file invalid.
+    row_errors: tuple[RowError, ...] = ()
     # SHA-256 of the original file bytes (BOM included); None unless valid.
     sha256: str | None = None
 
@@ -66,14 +88,20 @@ def check_csv_file(path: Path, max_size_bytes: int) -> FileCheckResult:
     try:
         content = read_file(path, max_size_bytes)
         text = decode_utf8(content)
-        rows = parse_rows(text)
+        header, *records = parse_records(text)
+        header_problem = find_header_problem(header)
+        if header_problem:
+            raise CsvFileError(header_problem)
     except CsvFileError as error:
         return FileCheckResult(path, is_valid=False, message=str(error))
+
+    rows, row_errors = validate_rows(header, records)
     return FileCheckResult(
         path,
         is_valid=True,
         message="File passed all checks.",
         rows=rows,
+        row_errors=row_errors,
         sha256=hashlib.sha256(content).hexdigest(),
     )
 
@@ -116,25 +144,59 @@ def decode_utf8(content: bytes) -> str:
     return text
 
 
-def parse_rows(text: str) -> tuple[dict, ...]:
+def parse_records(text: str) -> list[list[str]]:
     # newline="" lets the csv module handle LF, CRLF and newlines inside quotes.
     # strict=True rejects unclosed quotes and text after a closing quote, which
-    # the default mode silently accepts.
-    reader = csv.DictReader(io.StringIO(text, newline=""), strict=True)
+    # the default mode silently accepts. A plain reader (not DictReader) keeps
+    # each record's real field count for the row checks.
+    reader = csv.reader(io.StringIO(text, newline=""), strict=True)
     try:
-        header_problem = find_header_problem(reader.fieldnames)
-        if header_problem:
-            raise CsvFileError(header_problem)
-        # Rows with too few or too many fields are kept as DictReader maps them
-        # (missing values are None, extras sit under the None key) for
-        # row-level validation to reject later.
-        return tuple(reader)
+        return list(reader)
     except csv.Error as error:
-        # DictReader.line_num only updates after a successful row, so read the
-        # underlying reader's count to report the line that actually failed.
         raise CsvFileError(
-            f"Malformed CSV near line {reader.reader.line_num}: {error}."
+            f"Malformed CSV near line {reader.line_num}: {error}."
         ) from error
+
+
+def validate_rows(
+    header: list[str], records: list[list[str]]
+) -> tuple[tuple[CsvRow, ...], tuple[RowError, ...]]:
+    rows, errors = [], []
+    # Records are numbered like spreadsheet rows: header is 1, so data starts at 2.
+    for row_number, record in enumerate(records, start=2):
+        if not record:
+            continue  # Blank line: nothing to import, but it still takes a number.
+        outcome = validate_row(header, record, row_number)
+        (errors if isinstance(outcome, RowError) else rows).append(outcome)
+    return tuple(rows), tuple(errors)
+
+
+def validate_row(
+    header: list[str], record: list[str], row_number: int
+) -> CsvRow | RowError:
+    if len(record) != len(header):
+        return RowError(
+            row_number,
+            WHOLE_ROW,
+            f"Row has {len(record)} column(s); expected {len(header)}.",
+        )
+
+    values = dict(zip(header, record, strict=True))
+    missing = [
+        name
+        for name in REQUIRED_HEADERS
+        if name not in OPTIONAL_FIELDS and not values[name].strip()
+    ]
+    if missing:
+        # One error per row (import_row_errors is unique on batch_id, row_number);
+        # column_name points at the first missing field, the message lists all.
+        return RowError(
+            row_number,
+            missing[0],
+            f"Missing required value(s): {', '.join(missing)}.",
+            transaction_id=values["transaction_id"].strip() or None,
+        )
+    return CsvRow(row_number, values)
 
 
 def find_header_problem(header: Sequence[str] | None) -> str | None:
@@ -188,6 +250,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(f"{result.sha256}  {result.path}")
+    print(f"Rows: {len(result.rows)} valid, {len(result.row_errors)} invalid.")
+    for error in result.row_errors:
+        print(f"Row {error.row_number}: {error.message}")
     return record_batch(result)
 
 
@@ -221,6 +286,8 @@ def register_import_batch(
 
 
 def record_batch(result: FileCheckResult) -> int:
+    if result.sha256 is None:
+        raise ValueError("Only a valid file (with a hash) can be recorded as a batch.")
     try:
         with SessionLocal() as session:
             registration = register_import_batch(

@@ -11,6 +11,8 @@ from app.database import Base
 from app.models import ImportBatch
 from app.services import csv_validator
 from app.services.csv_validator import (
+    CsvRow,
+    RowError,
     check_csv_file,
     main,
     register_import_batch,
@@ -190,14 +192,14 @@ def test_utf8_with_non_ascii_text_passes(tmp_path):
     result = check(tmp_path, csv_bytes(rows=[row]))
 
     assert result.is_valid is True
-    assert result.rows[0]["product_name"] == "Masala Chai ☕ ₹20"
+    assert result.rows[0].values["product_name"] == "Masala Chai ☕ ₹20"
 
 
 def test_utf8_with_bom_passes_and_bom_is_not_part_of_first_header(tmp_path):
     result = check(tmp_path, UTF8_BOM + VALID_CONTENT)
 
     assert result.is_valid is True
-    assert result.rows == (EXPECTED_ROW,)
+    assert result.rows == (CsvRow(2, EXPECTED_ROW),)
 
 
 def test_file_containing_only_a_bom_is_empty(tmp_path):
@@ -240,7 +242,7 @@ def test_lf_and_crlf_line_endings_pass(tmp_path, content):
     result = check(tmp_path, content)
 
     assert result.is_valid is True
-    assert result.rows == (EXPECTED_ROW,)
+    assert result.rows == (CsvRow(2, EXPECTED_ROW),)
 
 
 def test_well_formed_quoting_passes(tmp_path):
@@ -249,7 +251,7 @@ def test_well_formed_quoting_passes(tmp_path):
     result = check(tmp_path, csv_bytes(rows=[row], newline="\r\n"))
 
     assert result.is_valid is True
-    assert result.rows[0]["product_name"] == 'comma, "quotes" and\r\nnewline'
+    assert result.rows[0].values["product_name"] == 'comma, "quotes" and\r\nnewline'
 
 
 @pytest.mark.parametrize(
@@ -273,8 +275,8 @@ def test_malformed_quoting_fails(tmp_path, bad_product_name):
 def test_valid_header_maps_rows_by_name(tmp_path):
     result = check(tmp_path, VALID_CONTENT)
 
-    assert result.rows == (EXPECTED_ROW,)
-    assert result.rows[0]["original_transaction_id"] == ""
+    assert result.rows == (CsvRow(2, EXPECTED_ROW),)
+    assert result.rows[0].values["original_transaction_id"] == ""
 
 
 def test_reordered_columns_map_values_by_header_name(tmp_path):
@@ -283,7 +285,7 @@ def test_reordered_columns_map_values_by_header_name(tmp_path):
     result = check(tmp_path, reordered)
 
     assert result.is_valid is True
-    assert result.rows == (EXPECTED_ROW,)
+    assert result.rows == (CsvRow(2, EXPECTED_ROW),)
 
 
 def test_header_only_file_is_valid_with_no_rows(tmp_path):
@@ -413,6 +415,7 @@ def test_cli_prints_hash_for_valid_file(tmp_path, capsys, session_factory):
     assert exit_code == 0
     assert output.out == (
         f"{hashlib.sha256(VALID_CONTENT).hexdigest()}  {path}\n"
+        "Rows: 1 valid, 0 invalid.\n"
         f"Created import batch {batch.id} with status QUEUED.\n"
     )
     assert output.err == ""
@@ -557,3 +560,182 @@ def test_cli_reports_database_failure_cleanly(tmp_path, capsys, monkeypatch):
     assert err == (
         f"ERROR {path}: could not record the import batch (database unavailable).\n"
     )
+
+
+# Row-by-row validation
+
+REQUIRED_FIELDS = [name for name in HEADER if name != "original_transaction_id"]
+
+
+def row_with(**changes):
+    return [changes.get(name, value) for name, value in zip(HEADER, ROW, strict=True)]
+
+
+def check_rows(tmp_path, rows, header=HEADER):
+    result = check(tmp_path, csv_bytes(header=header, rows=rows))
+    assert result.is_valid is True  # Row problems never fail the whole file.
+    return result
+
+
+def test_valid_row_is_kept_with_its_csv_row_number(tmp_path):
+    result = check_rows(tmp_path, [ROW])
+
+    assert result.rows == (CsvRow(2, EXPECTED_ROW),)
+    assert result.row_errors == ()
+
+
+def test_empty_original_transaction_id_is_allowed_for_normal_sale(tmp_path):
+    result = check_rows(tmp_path, [row_with(original_transaction_id="")])
+
+    assert result.row_errors == ()
+    assert result.rows[0].values["original_transaction_id"] == ""
+
+
+def test_filled_original_transaction_id_is_kept(tmp_path):
+    result = check_rows(tmp_path, [row_with(original_transaction_id="T0")])
+
+    assert result.rows[0].values["original_transaction_id"] == "T0"
+
+
+@pytest.mark.parametrize(
+    "field_count",
+    [1, 9, 11, 12],
+    ids=["one-field", "one-too-few", "one-too-many", "two-too-many"],
+)
+def test_row_without_exactly_ten_fields_is_rejected(tmp_path, field_count):
+    record = (ROW + ["extra", "extra"])[:field_count]
+
+    result = check_rows(tmp_path, [record])
+
+    assert result.rows == ()
+    assert result.row_errors == (
+        RowError(2, "__row__", f"Row has {field_count} column(s); expected 10."),
+    )
+
+
+@pytest.mark.parametrize("field", REQUIRED_FIELDS)
+def test_each_empty_required_field_is_rejected(tmp_path, field):
+    result = check_rows(tmp_path, [row_with(**{field: ""})])
+
+    assert result.rows == ()
+    assert result.row_errors == (
+        RowError(
+            2,
+            field,
+            f"Missing required value(s): {field}.",
+            transaction_id=None if field == "transaction_id" else "T1",
+        ),
+    )
+
+
+@pytest.mark.parametrize("blank", [" ", "   ", "\t"], ids=["space", "spaces", "tab"])
+def test_whitespace_only_required_value_counts_as_empty(tmp_path, blank):
+    result = check_rows(tmp_path, [row_with(sku=blank)])
+
+    assert result.row_errors == (
+        RowError(2, "sku", "Missing required value(s): sku.", transaction_id="T1"),
+    )
+
+
+def test_all_missing_fields_are_listed_and_first_is_the_column(tmp_path):
+    result = check_rows(tmp_path, [row_with(quantity="", sku="", payment_mode="")])
+
+    assert result.row_errors == (
+        RowError(
+            2,
+            "sku",
+            "Missing required value(s): sku, quantity, payment_mode.",
+            transaction_id="T1",
+        ),
+    )
+
+
+def test_completely_empty_values_row_is_rejected(tmp_path):
+    result = check_rows(tmp_path, [[""] * 10])
+
+    error = result.row_errors[0]
+    assert (error.row_number, error.column_name, error.transaction_id) == (
+        2,
+        "transaction_id",
+        None,
+    )
+    assert error.message == f"Missing required value(s): {', '.join(REQUIRED_FIELDS)}."
+
+
+def test_processing_continues_after_invalid_rows(tmp_path):
+    rows = [
+        row_with(transaction_id="T1"),  # row 2: valid
+        row_with(transaction_id="T2", sku=""),  # row 3: missing sku
+        ROW[:9],  # row 4: 9 fields
+        row_with(transaction_id="T5"),  # row 5: valid
+        row_with(transaction_id="T6", store_code=""),  # row 6: missing store
+    ]
+
+    result = check_rows(tmp_path, rows)
+
+    assert [(row.row_number, row.values["transaction_id"]) for row in result.rows] == [
+        (2, "T1"),
+        (5, "T5"),
+    ]
+    assert [(e.row_number, e.column_name) for e in result.row_errors] == [
+        (3, "sku"),
+        (4, "__row__"),
+        (6, "store_code"),
+    ]
+
+
+def test_file_with_only_invalid_rows_is_still_a_valid_file(tmp_path):
+    result = check_rows(tmp_path, [row_with(sku=""), ROW[:3]])
+
+    assert result.rows == ()
+    assert len(result.row_errors) == 2
+    assert result.sha256 is not None
+
+
+def test_blank_lines_are_skipped_but_keep_row_numbering(tmp_path):
+    content = HEADER_LINE + b"\n" + csv_bytes(header=[], rows=[ROW]).lstrip(b"\n")
+
+    result = check(tmp_path, content)
+
+    assert result.rows == (CsvRow(3, EXPECTED_ROW),)
+    assert result.row_errors == ()
+
+
+def test_row_numbers_count_records_not_lines_in_multiline_fields(tmp_path):
+    multiline = row_with(transaction_id="T1", product_name='"Masala\nChai"')
+    broken = row_with(transaction_id="T2", sku="")
+
+    result = check_rows(tmp_path, [multiline, broken])
+
+    assert result.rows[0].row_number == 2
+    assert result.rows[0].values["product_name"] == "Masala\nChai"
+    assert result.row_errors[0].row_number == 3
+
+
+def test_missing_value_is_found_by_name_in_reordered_columns(tmp_path):
+    reordered_row = row_with(sku="")[::-1]
+
+    result = check_rows(tmp_path, [reordered_row], header=HEADER[::-1])
+
+    assert result.row_errors == (
+        RowError(2, "sku", "Missing required value(s): sku.", transaction_id="T1"),
+    )
+
+
+def test_cli_lists_invalid_rows_and_still_creates_batch(
+    tmp_path, capsys, session_factory
+):
+    rows = [ROW, row_with(transaction_id="T2", sku=""), ROW[:9]]
+    path = write_file(tmp_path, "sales.csv", csv_bytes(rows=rows))
+
+    exit_code = main([str(path)])
+
+    out = capsys.readouterr().out.splitlines()
+    assert exit_code == 0
+    assert out[1:4] == [
+        "Rows: 1 valid, 2 invalid.",
+        "Row 3: Missing required value(s): sku.",
+        "Row 4: Row has 9 column(s); expected 10.",
+    ]
+    assert out[4].startswith("Created import batch")
+    assert only_batch(session_factory).status == "QUEUED"
