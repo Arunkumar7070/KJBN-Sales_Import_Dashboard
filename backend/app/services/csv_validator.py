@@ -550,6 +550,35 @@ def load_import_state(session: Session, rows: Sequence[CsvRow]) -> ImportState:
         .where(Transaction.quantity < 0)
         .group_by(Transaction.original_transaction_id)
     )
+
+    # Lock the original sales (SELECT ... FOR UPDATE) before reading how much
+    # of them was already returned. A concurrent import returning against the
+    # same sale blocks here until this import commits, then reads the returns
+    # it saved, so two imports can never both use the same remaining quantity.
+    # Locks are taken in transaction_id order (ORDER BY, and sorted chunks), so
+    # every import locks in the same order and two imports cannot deadlock.
+    # The locks are held until process_batch commits or rolls back.
+    originals = {
+        row[0]: sale_row_from_database(row)
+        for row in fetch_where_in(
+            session,
+            original_columns.order_by(Transaction.transaction_id).with_for_update(),
+            Transaction.transaction_id,
+            original_ids,
+        )
+    }
+    # Read only after the locks are held, so it includes every committed return.
+    returned_quantity = Counter(
+        dict(
+            fetch_where_in(
+                session,
+                returned_by_original,
+                Transaction.original_transaction_id,
+                original_ids,
+            )
+        )
+    )
+
     return ImportState(
         existing_transaction_ids={
             transaction_id
@@ -580,22 +609,8 @@ def load_import_state(session: Session, rows: Sequence[CsvRow]) -> ImportState:
                 skus,
             )
         },
-        originals={
-            row[0]: sale_row_from_database(row)
-            for row in fetch_where_in(
-                session, original_columns, Transaction.transaction_id, original_ids
-            )
-        },
-        returned_quantity=Counter(
-            dict(
-                fetch_where_in(
-                    session,
-                    returned_by_original,
-                    Transaction.original_transaction_id,
-                    original_ids,
-                )
-            )
-        ),
+        originals=originals,
+        returned_quantity=returned_quantity,
     )
 
 
