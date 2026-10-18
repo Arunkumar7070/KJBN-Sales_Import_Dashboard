@@ -1104,17 +1104,104 @@ def test_invalid_returns_are_rejected(
     ]
 
 
-def test_return_listed_before_its_sale_is_not_found(tmp_path, session_factory):
+def a_return(transaction_id, sold_at, quantity="-1", original="T1", **changes):
+    return row_with(
+        transaction_id=transaction_id,
+        sold_at=sold_at,
+        quantity=quantity,
+        original_transaction_id=original,
+        **changes,
+    )
+
+
+def test_return_listed_before_its_sale_is_accepted(tmp_path, session_factory):
     rows = [
-        row_with(transaction_id="R1", quantity="-1", original_transaction_id="T1"),
-        row_with(transaction_id="T1"),
+        a_return("R1", "2026-10-17 11:00:00"),  # row 2
+        row_with(transaction_id="T1", sold_at="2026-10-17 09:00:00"),  # row 3
+    ]
+
+    import_csv(tmp_path, rows)
+
+    saved = saved_transactions(session_factory)
+    batch = only_batch(session_factory)
+    assert sorted(saved) == ["R1", "T1"]
+    assert saved["R1"].original_transaction_id == "T1"
+    assert saved_row_errors(session_factory, batch) == []
+    assert (batch.rows_accepted, batch.rows_rejected) == (2, 0)
+
+
+def test_sale_is_processed_before_return_at_the_same_time(tmp_path, session_factory):
+    same_time = "2026-10-17 09:00:00"
+    rows = [
+        a_return("R1", same_time),
+        row_with(transaction_id="T1", sold_at=same_time),
+    ]
+
+    import_csv(tmp_path, rows)
+
+    assert sorted(saved_transactions(session_factory)) == ["R1", "T1"]
+
+
+def test_errors_keep_original_csv_row_numbers_after_sorting(tmp_path, session_factory):
+    rows = [
+        a_return("R1", "2026-10-17 11:00:00"),  # row 2: valid
+        row_with(transaction_id="T1", sold_at="2026-10-17 09:00:00"),  # row 3
+        a_return("R2", "2026-10-17 12:00:00", quantity="-5"),  # row 4: over-return
+        row_with(transaction_id="T9", sold_at="2026-10-17 08:00:00", sku=""),  # row 5
+        row_with(  # row 6: earliest time, bad payment mode
+            transaction_id="T6", sold_at="2026-10-17 07:00:00", payment_mode="CHEQUE"
+        ),
+        row_with(transaction_id="T7", sold_at="not a date"),  # row 7
+    ]
+
+    import_csv(tmp_path, rows)
+
+    errors = saved_row_errors(session_factory, only_batch(session_factory))
+    assert [(row, column, tid) for row, column, _, tid in errors] == [
+        (4, "quantity", "R2"),
+        (5, "sku", "T9"),
+        (6, "payment_mode", "T6"),
+        (7, "sold_at", "T7"),
+    ]
+    assert sorted(saved_transactions(session_factory)) == ["R1", "T1"]
+
+
+def test_return_timed_before_its_sale_is_still_rejected(tmp_path, session_factory):
+    rows = [
+        row_with(transaction_id="T1", sold_at="2026-10-17 09:00:00"),
+        a_return("R1", "2026-10-17 08:59:59"),
     ]
 
     import_csv(tmp_path, rows)
 
     assert list(saved_transactions(session_factory)) == ["T1"]
-    errors = saved_row_errors(session_factory, only_batch(session_factory))
-    assert errors[0][:2] == (2, "original_transaction_id")
+    assert saved_row_errors(session_factory, only_batch(session_factory)) == [
+        (
+            3,
+            "original_transaction_id",
+            "Original transaction 'T1' not found.",
+            "R1",
+        )
+    ]
+
+
+def test_chronologically_first_duplicate_is_kept(tmp_path, session_factory):
+    rows = [
+        row_with(transaction_id="T1", sold_at="2026-10-17 10:00:00", quantity="7"),
+        row_with(transaction_id="T1", sold_at="2026-10-17 09:00:00", quantity="2"),
+    ]
+
+    import_csv(tmp_path, rows)
+
+    assert saved_transactions(session_factory)["T1"].quantity == 2
+    assert saved_row_errors(session_factory, only_batch(session_factory)) == [
+        (
+            2,
+            "transaction_id",
+            "Transaction ID 'T1' already appears in row 3.",
+            "T1",
+        )
+    ]
 
 
 # Products and aliases

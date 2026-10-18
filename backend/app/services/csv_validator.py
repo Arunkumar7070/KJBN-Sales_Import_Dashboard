@@ -47,7 +47,9 @@ from app.services.sales_rules import (
     SaleRow,
     SaleRuleViolation,
     line_total_paise,
+    parse_quantity,
     parse_sale_row,
+    parse_sold_at,
     validate_sale,
 )
 
@@ -386,7 +388,7 @@ def import_rows(
     state = load_import_state(session, result.rows)
     errors = list(result.row_errors)
     accepted = 0
-    for row in result.rows:
+    for row in sorted(result.rows, key=chronological_order):
         try:
             sale = accept_row(row.values, state, clock)
         except SaleRuleViolation as violation:
@@ -414,6 +416,22 @@ def import_rows(
         for error in errors
     )
     return accepted, errors
+
+
+def chronological_order(row: CsvRow) -> tuple[bool, datetime, bool, int]:
+    """Sort key: oldest sold_at first, sales before returns at the same time.
+
+    Rows are processed in this order so a return listed above its sale in the
+    file still finds the sale. Rows whose sold_at or quantity cannot be parsed
+    will be rejected anyway; they go last, in file order. row_number breaks
+    ties and is never changed, so errors still name the original CSV row.
+    """
+    try:
+        sold_at = parse_sold_at(row.values["sold_at"])
+        is_return = parse_quantity(row.values["quantity"]) < 0
+    except SaleRuleViolation:
+        return (True, datetime.max.replace(tzinfo=UTC), False, row.row_number)
+    return (False, sold_at, is_return, row.row_number)
 
 
 def accept_row(
