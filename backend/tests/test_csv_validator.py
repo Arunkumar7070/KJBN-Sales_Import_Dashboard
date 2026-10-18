@@ -479,10 +479,9 @@ def test_cli_rejects_missing_file(tmp_path, capsys):
     assert capsys.readouterr().err == f"INVALID {path}: File does not exist.\n"
 
 
-@pytest.mark.parametrize("argv", [[], ["a.csv", "b.csv"]], ids=["none", "two"])
-def test_cli_requires_exactly_one_path(argv):
+def test_cli_requires_at_least_one_path():
     with pytest.raises(SystemExit) as excinfo:
-        main(argv)
+        main([])
 
     assert excinfo.value.code == 2
 
@@ -1511,3 +1510,139 @@ def test_stale_lookup_conflict_rejects_only_that_row(
             "SHARED",
         )
     ]
+
+
+# Several files in one run
+
+
+def summary_lines(stdout):
+    lines = stdout.splitlines()
+    return lines[lines.index("") + 1 :]  # The summary follows a blank line.
+
+
+def test_multiple_valid_files_are_all_imported(tmp_path, capsys, session_factory):
+    day1 = write_file(
+        tmp_path, "day1.csv", csv_bytes(rows=[row_with(transaction_id="T1")])
+    )
+    day2 = write_file(
+        tmp_path, "day2.csv", csv_bytes(rows=[row_with(transaction_id="T2")])
+    )
+
+    exit_code = main([str(day1), str(day2)])
+
+    batch1 = batch_named(session_factory, "day1.csv")
+    batch2 = batch_named(session_factory, "day2.csv")
+    assert exit_code == 0
+    assert sorted(saved_transactions(session_factory)) == ["T1", "T2"]
+    assert summary_lines(capsys.readouterr().out) == [
+        "Summary: 2 files: 2 imported.",
+        f"  IMPORTED  {day1}: batch {batch1.id}: 1 accepted, 0 rejected.",
+        f"  IMPORTED  {day2}: batch {batch2.id}: 1 accepted, 0 rejected.",
+    ]
+
+
+def test_bad_and_duplicate_files_are_reported_and_the_rest_imported(
+    tmp_path, capsys, session_factory
+):
+    good1 = write_file(
+        tmp_path, "good1.csv", csv_bytes(rows=[row_with(transaction_id="T1")])
+    )
+    bad_header = write_file(tmp_path, "bad.csv", csv_bytes(header=HEADER[:-1]))
+    same_as_good1 = write_file(tmp_path, "copy.csv", good1.read_bytes())
+    good2 = write_file(
+        tmp_path, "good2.csv", csv_bytes(rows=[row_with(transaction_id="T2")])
+    )
+
+    exit_code = main([str(good1), str(bad_header), str(same_as_good1), str(good2)])
+
+    output = capsys.readouterr()
+    batch1 = batch_named(session_factory, "good1.csv")
+    batch2 = batch_named(session_factory, "good2.csv")
+    assert exit_code == 1  # Not every file imported.
+    assert sorted(saved_transactions(session_factory)) == ["T1", "T2"]
+    assert len(all_batches(session_factory)) == 2  # No batch for bad or copy.
+    assert f"INVALID {bad_header}: Invalid header" in output.err
+    assert f"ALREADY UPLOADED {same_as_good1}" in output.err
+    assert summary_lines(output.out) == [
+        "Summary: 4 files: 2 imported, 1 invalid, 1 already uploaded.",
+        f"  IMPORTED          {good1}: batch {batch1.id}: 1 accepted, 0 rejected.",
+        (
+            f"  INVALID           {bad_header}: Invalid header: missing column(s): "
+            "original_transaction_id."
+        ),
+        (
+            f"  ALREADY UPLOADED  {same_as_good1}: this file was already uploaded as "
+            f"'good1.csv' (batch {batch1.id}, status COMPLETED)."
+        ),
+        f"  IMPORTED          {good2}: batch {batch2.id}: 1 accepted, 0 rejected.",
+    ]
+
+
+def test_same_file_twice_in_one_run_is_imported_once(tmp_path, capsys, session_factory):
+    path = write_file(tmp_path, "sales.csv")
+
+    exit_code = main([str(path), str(path)])
+
+    assert exit_code == 1
+    assert list(saved_transactions(session_factory)) == ["T1"]
+    assert summary_lines(capsys.readouterr().out)[0] == (
+        "Summary: 2 files: 1 imported, 1 already uploaded."
+    )
+
+
+def test_unexpected_error_in_one_file_does_not_stop_the_others(
+    tmp_path, capsys, session_factory, monkeypatch
+):
+    broken = write_file(
+        tmp_path, "broken.csv", csv_bytes(rows=[row_with(transaction_id="T1")])
+    )
+    good = write_file(
+        tmp_path, "good.csv", csv_bytes(rows=[row_with(transaction_id="T2")])
+    )
+    real_check = csv_validator.check_csv_file
+
+    def crash_on_broken(path, max_size_bytes):
+        if path.name == "broken.csv":
+            raise RuntimeError("disk on fire")
+        return real_check(path, max_size_bytes)
+
+    monkeypatch.setattr(csv_validator, "check_csv_file", crash_on_broken)
+
+    exit_code = main([str(broken), str(good)])
+
+    output = capsys.readouterr()
+    assert exit_code == 1
+    assert list(saved_transactions(session_factory)) == ["T2"]
+    assert "disk on fire" not in output.err  # Details go to the log only.
+    assert summary_lines(output.out)[:2] == [
+        "Summary: 2 files: 1 imported, 1 error.",
+        f"  ERROR     {broken}: unexpected error (details are in the log)",
+    ]
+
+
+def test_database_down_reports_every_file_without_crashing(
+    tmp_path, capsys, monkeypatch
+):
+    def unavailable():
+        raise OperationalError("connect", {}, Exception("password=secret"))
+
+    monkeypatch.setattr(csv_validator, "SessionLocal", unavailable)
+    first = write_file(
+        tmp_path, "a.csv", csv_bytes(rows=[row_with(transaction_id="T1")])
+    )
+    second = write_file(
+        tmp_path, "b.csv", csv_bytes(rows=[row_with(transaction_id="T2")])
+    )
+
+    exit_code = main([str(first), str(second)])
+
+    output = capsys.readouterr()
+    assert exit_code == 1
+    assert "password" not in output.out + output.err
+    assert summary_lines(output.out)[0] == "Summary: 2 files: 2 error."
+
+
+def test_single_file_prints_no_summary(tmp_path, capsys):
+    main([str(write_file(tmp_path, "sales.csv"))])
+
+    assert "Summary:" not in capsys.readouterr().out

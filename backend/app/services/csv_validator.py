@@ -14,7 +14,11 @@ import_row_errors, valid rows go to transactions, and the batch gets its counts
 and final status.
 
 Usage (from backend/):
-    python -m app.services.csv_validator sales.csv
+    python -m app.services.csv_validator sales.csv [more.csv ...]
+
+Each file is handled on its own: an invalid, duplicate or failing file is
+reported and the remaining files are still imported. With two or more files a
+summary is printed at the end. The exit code is 0 only if every file imported.
 """
 
 import argparse
@@ -261,20 +265,66 @@ def describe_unexpected(name: str) -> str:
     return f"'{name}'"
 
 
+IMPORTED = "IMPORTED"
+INVALID = "INVALID"
+ALREADY_UPLOADED = "ALREADY UPLOADED"
+FAILED = "FAILED"
+ERROR = "ERROR"
+SUMMARY_ORDER = (IMPORTED, INVALID, ALREADY_UPLOADED, FAILED, ERROR)
+
+
+@dataclass(frozen=True)
+class FileOutcome:
+    path: Path
+    status: str  # One of SUMMARY_ORDER.
+    detail: str
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Validate a sales CSV file and import its rows."
+        description="Validate sales CSV files and import their rows."
     )
-    parser.add_argument("path", type=Path, help="CSV file path")
+    parser.add_argument(
+        "paths", nargs="+", type=Path, metavar="path", help="CSV file(s) to import"
+    )
     args = parser.parse_args(argv)
 
-    result = check_csv_file(args.path, get_settings().max_upload_size_bytes)
-    if not result.is_valid:
-        print(f"INVALID {result.path}: {result.message}", file=sys.stderr)
-        return 1
+    max_size_bytes = get_settings().max_upload_size_bytes
+    outcomes = [import_file(path, max_size_bytes) for path in args.paths]
+    if len(outcomes) > 1:
+        print_summary(outcomes)
+    return 0 if all(outcome.status == IMPORTED for outcome in outcomes) else 1
 
-    print(f"{result.sha256}  {result.path}")
-    return record_batch(result)
+
+def import_file(path: Path, max_size_bytes: int) -> FileOutcome:
+    """Validate and import one file; never raises, so one bad file can't stop the rest."""
+    try:
+        result = check_csv_file(path, max_size_bytes)
+        if not result.is_valid:
+            print(f"INVALID {result.path}: {result.message}", file=sys.stderr)
+            return FileOutcome(path, INVALID, result.message)
+        print(f"{result.sha256}  {result.path}")
+        return record_batch(result)
+    except Exception:
+        logger.exception("Unexpected error while importing %s", path)
+        print(
+            f"ERROR {path}: unexpected error (details are in the log).", file=sys.stderr
+        )
+        return FileOutcome(path, ERROR, "unexpected error (details are in the log)")
+
+
+def print_summary(outcomes: list[FileOutcome]) -> None:
+    counts = Counter(outcome.status for outcome in outcomes)
+    totals = ", ".join(
+        f"{counts[status]} {status.lower()}"
+        for status in SUMMARY_ORDER
+        if counts[status]
+    )
+    width = max(len(status) for status in counts)
+    print()
+    print(f"Summary: {len(outcomes)} files: {totals}.")
+    for outcome in outcomes:
+        print(f"  {outcome.status:<{width}}  {outcome.path}: {outcome.detail}")
 
 
 def utc_now() -> datetime:
@@ -698,7 +748,7 @@ def fetch_where_in(session: Session, statement, column, values: set[str]) -> lis
     return results
 
 
-def record_batch(result: FileCheckResult) -> int:
+def record_batch(result: FileCheckResult) -> FileOutcome:
     if result.sha256 is None:
         raise ValueError("Only a valid file (with a hash) can be recorded as a batch.")
     try:
@@ -712,24 +762,22 @@ def record_batch(result: FileCheckResult) -> int:
             # a file again retries one that never ran or failed (nothing was
             # saved), and is refused if it is processing or already completed.
             if not claim_batch(session, batch):
-                print(
-                    f"ALREADY UPLOADED {result.path}: this file was already uploaded "
-                    f"as '{batch.filename}' (batch {batch.id}, status {batch.status}).",
-                    file=sys.stderr,
+                detail = (
+                    f"this file was already uploaded as '{batch.filename}' "
+                    f"(batch {batch.id}, status {batch.status})."
                 )
-                return 1
+                print(f"ALREADY UPLOADED {result.path}: {detail}", file=sys.stderr)
+                return FileOutcome(result.path, ALREADY_UPLOADED, detail)
             errors = process_batch(session, batch, result)
     except SQLAlchemyError:
         logger.exception("Could not import %s", result.path)
-        print(
-            f"ERROR {result.path}: could not import the file (database unavailable).",
-            file=sys.stderr,
-        )
-        return 1
+        detail = "could not import the file (database unavailable)."
+        print(f"ERROR {result.path}: {detail}", file=sys.stderr)
+        return FileOutcome(result.path, ERROR, detail)
 
     if batch.status != "COMPLETED":
         print(f"Batch {batch.id} FAILED: {batch.failure_reason}", file=sys.stderr)
-        return 1
+        return FileOutcome(result.path, FAILED, batch.failure_reason or "")
 
     print(
         f"Batch {batch.id} COMPLETED: {batch.rows_total} rows, "
@@ -737,7 +785,12 @@ def record_batch(result: FileCheckResult) -> int:
     )
     for error in errors:
         print(f"Row {error.row_number} [{error.column_name}]: {error.message}")
-    return 0
+    return FileOutcome(
+        result.path,
+        IMPORTED,
+        f"batch {batch.id}: {batch.rows_accepted} accepted, "
+        f"{batch.rows_rejected} rejected.",
+    )
 
 
 if __name__ == "__main__":
