@@ -47,12 +47,8 @@ def sale(**overrides):
 
 
 def return_of(quantity, **overrides):
-    return sale(
-        transaction_id="T2",
-        quantity=quantity,
-        original_transaction_id="T1",
-        **overrides,
-    )
+    defaults = {"transaction_id": "T2", "original_transaction_id": "T1"}
+    return sale(**(defaults | overrides), quantity=quantity)
 
 
 @pytest.fixture
