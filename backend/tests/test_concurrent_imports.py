@@ -1,10 +1,10 @@
-"""Concurrency test for returns against the same original sale.
+"""Concurrency tests for imports running at the same time.
 
 Needs real PostgreSQL row locks (SQLite ignores SELECT ... FOR UPDATE), so it
 runs only when TEST_POSTGRES_URL is set. All tables live in a temporary schema
 that is dropped afterwards; existing tables in that database are not touched.
 
-    TEST_POSTGRES_URL=postgresql://user@localhost:5432/postgres pytest tests/test_concurrent_returns.py
+    TEST_POSTGRES_URL=postgresql://user@localhost:5432/postgres pytest tests/test_concurrent_imports.py
 """
 
 import os
@@ -96,7 +96,7 @@ def write_return_file(directory, name, return_id, sold_at):
     return path
 
 
-def wait_until_a_backend_waits_on_a_lock(engine):
+def wait_until_a_backend_waits_on_a_lock(engine, failure_message):
     deadline = time.monotonic() + LOCK_WAIT_TIMEOUT_SECONDS
     query = text(
         "SELECT count(*) FROM pg_stat_activity "
@@ -107,10 +107,7 @@ def wait_until_a_backend_waits_on_a_lock(engine):
             if connection.scalar(query):
                 return
         time.sleep(0.05)
-    pytest.fail(
-        "Import B never waited for a row lock: it read the original sale "
-        "without SELECT ... FOR UPDATE, so both imports could return it."
-    )
+    pytest.fail(failure_message)
 
 
 def test_concurrent_returns_of_last_unit_only_one_succeeds(
@@ -147,7 +144,11 @@ def test_concurrent_returns_of_last_unit_only_one_succeeds(
     assert a_holds_lock.wait(LOCK_WAIT_TIMEOUT_SECONDS)
     thread_b.start()
     try:
-        wait_until_a_backend_waits_on_a_lock(engine)
+        wait_until_a_backend_waits_on_a_lock(
+            engine,
+            "Import B never waited for a row lock: it read the original sale "
+            "without SELECT ... FOR UPDATE, so both imports could return it.",
+        )
     finally:
         release_a.set()
         thread_a.join(LOCK_WAIT_TIMEOUT_SECONDS)
@@ -180,4 +181,104 @@ def test_concurrent_returns_of_last_unit_only_one_succeeds(
                 "more than the 1 originally sold."
             ),
         )
+    ]
+
+
+def write_sales_file(directory, name, rows):
+    path = directory / name
+    path.write_text(
+        HEADER
+        + "".join(
+            f"{tid},ST01,{sold_at},SKU1,Masala Chai,{qty},100.00,0,UPI,\n"
+            for tid, sold_at, qty in rows
+        )
+    )
+    return path
+
+
+def test_overlapping_id_rejects_only_the_duplicate_and_keeps_new_rows(
+    postgres, tmp_path, monkeypatch
+):
+    factory, engine = postgres
+    with factory() as session:  # Store only: both files also race to create SKU1.
+        session.add(Store(code="ST01", name="Store One", city="Chennai"))
+        session.commit()
+    file_a = write_sales_file(
+        tmp_path,
+        "a.csv",
+        [("SHARED", "2026-10-17 09:00:00", 1), ("NEW_A", "2026-10-17 09:30:00", 1)],
+    )
+    file_b = write_sales_file(
+        tmp_path,
+        "b.csv",
+        [("SHARED", "2026-10-17 09:00:00", 7), ("NEW_B", "2026-10-17 09:45:00", 1)],
+    )
+
+    # Import A inserts its rows, then pauses before committing. Import B's
+    # lookups therefore see neither SHARED nor SKU1, and its INSERT blocks on
+    # A's uncommitted rows until A commits.
+    a_inserted = threading.Event()
+    release_a = threading.Event()
+    real_import_rows = csv_validator.import_rows
+
+    def import_then_pause_in_a(*args, **kwargs):
+        outcome = real_import_rows(*args, **kwargs)
+        if threading.current_thread().name == "import-a":
+            a_inserted.set()
+            release_a.wait(LOCK_WAIT_TIMEOUT_SECONDS)
+        return outcome
+
+    monkeypatch.setattr(csv_validator, "import_rows", import_then_pause_in_a)
+
+    exit_codes = {}
+
+    def run(name, path):
+        exit_codes[name] = csv_validator.main([str(path)])
+
+    thread_a = threading.Thread(target=run, args=("a", file_a), name="import-a")
+    thread_b = threading.Thread(target=run, args=("b", file_b), name="import-b")
+    thread_a.start()
+    assert a_inserted.wait(LOCK_WAIT_TIMEOUT_SECONDS)
+    thread_b.start()
+    try:
+        wait_until_a_backend_waits_on_a_lock(
+            engine,
+            "Import B never blocked on import A's uncommitted rows: rows were "
+            "not inserted (flushed) per row inside savepoints.",
+        )
+    finally:
+        release_a.set()
+        thread_a.join(LOCK_WAIT_TIMEOUT_SECONDS)
+        thread_b.join(LOCK_WAIT_TIMEOUT_SECONDS)
+
+    with factory() as session:
+        batches = {b.filename: b for b in session.scalars(select(ImportBatch)).all()}
+        saved = {
+            t.transaction_id: (t.batch_id, t.quantity)
+            for t in session.scalars(select(Transaction))
+        }
+        products = session.scalars(select(Product.sku)).all()
+        errors_b = session.execute(
+            select(
+                ImportRowError.row_number,
+                ImportRowError.column_name,
+                ImportRowError.message,
+            ).where(ImportRowError.batch_id == batches["b.csv"].id)
+        ).all()
+
+    batch_a, batch_b = batches["a.csv"], batches["b.csv"]
+    assert exit_codes == {"a": 0, "b": 0}
+    assert saved == {
+        "SHARED": (batch_a.id, 1),  # A committed first; B's copy was not saved.
+        "NEW_A": (batch_a.id, 1),
+        "NEW_B": (batch_b.id, 1),  # Kept even though B hit a conflict.
+    }
+    assert products == ["SKU1"]
+    assert (batch_b.status, batch_b.rows_accepted, batch_b.rows_rejected) == (
+        "COMPLETED",
+        1,
+        1,
+    )
+    assert errors_b == [
+        (2, "transaction_id", "Transaction ID 'SHARED' has already been imported.")
     ]

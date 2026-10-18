@@ -391,6 +391,7 @@ def import_rows(
     for row in processing_order(result.rows):
         try:
             sale = accept_row(row.values, state, clock)
+            save_row(session, state, batch, sale, row)
         except SaleRuleViolation as violation:
             errors.append(
                 RowError(
@@ -401,7 +402,6 @@ def import_rows(
                 )
             )
             continue
-        save_transaction(session, state, batch, sale, row)
         accepted += 1
 
     errors.sort(key=lambda error: error.row_number)
@@ -485,21 +485,66 @@ def accept_row(
     return sale
 
 
-def save_transaction(
+def save_row(
     session: Session,
     state: ImportState,
     batch: ImportBatch,
     sale: SaleRow,
     row: CsvRow,
 ) -> None:
+    """Insert one accepted row (and any new product or alias) in its own savepoint.
+
+    Another import can commit the same transaction ID, SKU or alias after this
+    import's lookups ran. PostgreSQL then rejects only this row's INSERT, and
+    rolling back just its savepoint keeps every other row of the batch:
+    - transaction ID now exists: the row is a duplicate (DUPLICATE_IN_DATABASE);
+    - otherwise a new product or alias was created by the other import:
+      reload it and insert the row again, once.
+    State is updated only after the row's savepoint succeeds.
+    """
+    for attempt in (1, 2):
+        try:
+            with session.begin_nested():  # Flushes on exit, so conflicts surface here.
+                new_product, new_alias = add_row(session, state, batch, sale, row)
+        except IntegrityError:
+            if transaction_exists(session, sale.transaction_id):
+                raise SaleRuleViolation(
+                    "DUPLICATE_IN_DATABASE",
+                    f"Transaction ID '{sale.transaction_id}' has already been "
+                    "imported.",
+                ) from None
+            if attempt == 2:
+                raise  # Not a known race; let the batch fail.
+            reload_product(session, state, sale.sku)
+            continue
+        break
+
+    if new_product:
+        state.product_names[sale.sku] = new_product.name
+    if new_alias:
+        state.aliases.add((sale.sku, new_alias.alias_name))
+    state.accepted_row_numbers[sale.transaction_id] = row.row_number
+    state.originals[sale.transaction_id] = sale
+    if sale.original_transaction_id:
+        state.returned_quantity[sale.original_transaction_id] += -sale.quantity
+
+
+def add_row(
+    session: Session,
+    state: ImportState,
+    batch: ImportBatch,
+    sale: SaleRow,
+    row: CsvRow,
+) -> tuple[Product | None, ProductAlias | None]:
     product_name = row.values["product_name"]
     known_name = state.product_names.get(sale.sku)
+    new_product = new_alias = None
     if known_name is None:
-        session.add(Product(sku=sale.sku, name=product_name))
-        state.product_names[sale.sku] = product_name
+        new_product = Product(sku=sale.sku, name=product_name)
+        session.add(new_product)
     elif product_name != known_name and (sale.sku, product_name) not in state.aliases:
-        session.add(ProductAlias(sku=sale.sku, alias_name=product_name))
-        state.aliases.add((sale.sku, product_name))
+        new_alias = ProductAlias(sku=sale.sku, alias_name=product_name)
+        session.add(new_alias)
 
     session.add(
         Transaction(
@@ -518,10 +563,30 @@ def save_transaction(
             is_return=sale.quantity < 0,
         )
     )
-    state.accepted_row_numbers[sale.transaction_id] = row.row_number
-    state.originals[sale.transaction_id] = sale
-    if sale.original_transaction_id:
-        state.returned_quantity[sale.original_transaction_id] += -sale.quantity
+    return new_product, new_alias
+
+
+def transaction_exists(session: Session, transaction_id: str) -> bool:
+    return (
+        session.scalar(
+            select(Transaction.transaction_id).where(
+                Transaction.transaction_id == transaction_id
+            )
+        )
+        is not None
+    )
+
+
+def reload_product(session: Session, state: ImportState, sku: str) -> None:
+    name = session.scalar(select(Product.name).where(Product.sku == sku))
+    if name is not None:
+        state.product_names[sku] = name
+    state.aliases.update(
+        (sku, alias)
+        for alias in session.scalars(
+            select(ProductAlias.alias_name).where(ProductAlias.sku == sku)
+        )
+    )
 
 
 def load_import_state(session: Session, rows: Sequence[CsvRow]) -> ImportState:

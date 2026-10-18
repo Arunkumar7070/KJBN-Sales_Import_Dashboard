@@ -1462,3 +1462,52 @@ def test_queued_batch_that_never_ran_is_processed_on_upload(tmp_path, session_fa
     batch = only_batch(session_factory)
     assert (batch.status, batch.attempt_count) == ("COMPLETED", 1)
     assert list(saved_transactions(session_factory)) == ["T1"]
+
+
+# Rows committed by another import after this import's lookups
+
+
+def test_stale_lookup_conflict_rejects_only_that_row(
+    tmp_path, session_factory, monkeypatch
+):
+    # day1 commits SHARED and creates SKU1. day2's lookups are then made stale,
+    # as if day1 committed between day2's lookup and its INSERTs.
+    import_csv(tmp_path, [row_with(transaction_id="SHARED")], name="day1.csv")
+    real_load = csv_validator.load_import_state
+
+    def stale_load(session, rows):
+        state = real_load(session, rows)
+        state.existing_transaction_ids.clear()
+        state.product_names.clear()
+        return state
+
+    monkeypatch.setattr(csv_validator, "load_import_state", stale_load)
+
+    exit_code = import_csv(
+        tmp_path,
+        [
+            row_with(transaction_id="SHARED", quantity="7"),
+            row_with(transaction_id="NEW_B"),
+        ],
+        name="day2.csv",
+    )
+
+    day2 = batch_named(session_factory, "day2.csv")
+    saved = saved_transactions(session_factory)
+    assert exit_code == 0
+    assert saved["SHARED"].quantity == 2  # day1's row is untouched.
+    assert saved["NEW_B"].batch_id == day2.id  # Kept despite the conflict.
+    assert saved_products(session_factory) == ({"SKU1": "Masala Chai"}, [])
+    assert (day2.status, day2.rows_accepted, day2.rows_rejected) == (
+        "COMPLETED",
+        1,
+        1,
+    )
+    assert saved_row_errors(session_factory, day2) == [
+        (
+            2,
+            "transaction_id",
+            "Transaction ID 'SHARED' has already been imported.",
+            "SHARED",
+        )
+    ]
