@@ -1,6 +1,7 @@
+import gzip
 import hashlib
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import BigInteger, create_engine, select
@@ -12,6 +13,7 @@ from app.config import Settings
 from app.database import Base
 from app.models import (
     ImportBatch,
+    ImportPayload,
     ImportRowError,
     Product,
     ProductAlias,
@@ -23,9 +25,12 @@ from app.services.csv_validator import (
     CsvRow,
     RowError,
     check_csv_file,
+    enqueue_upload,
     main,
     processing_order,
     register_import_batch,
+    run_next_batch,
+    run_worker,
 )
 
 MAX_SIZE_BYTES = 1000
@@ -1646,3 +1651,337 @@ def test_single_file_prints_no_summary(tmp_path, capsys):
     main([str(write_file(tmp_path, "sales.csv"))])
 
     assert "Summary:" not in capsys.readouterr().out
+
+
+# Staged uploads (import_payloads) and the background worker
+
+
+def enqueue(session_factory, content=VALID_CONTENT, filename="sales.csv"):
+    with session_factory() as session:
+        return enqueue_upload(session, filename, content, MAX_SIZE_BYTES)
+
+
+def staged_payloads(session_factory):
+    with session_factory() as session:
+        return session.scalars(select(ImportPayload)).all()
+
+
+def failing_lookups(times):
+    """A load_import_state that raises a database error on its first `times` calls."""
+    real_load = csv_validator.load_import_state
+    calls = {"count": 0}
+
+    def load(session, rows):
+        calls["count"] += 1
+        if calls["count"] <= times:
+            raise OperationalError("SELECT", {}, Exception("connection lost"))
+        return real_load(session, rows)
+
+    return load
+
+
+def test_enqueue_stores_gzipped_bytes_with_a_queued_batch(session_factory):
+    outcome = enqueue(session_factory)
+
+    batch = only_batch(session_factory)
+    [payload] = staged_payloads(session_factory)
+    assert (outcome.status, outcome.detail) == ("QUEUED", f"batch {batch.id} queued.")
+    assert (batch.status, batch.attempt_count, batch.filename) == (
+        "QUEUED",
+        0,
+        "sales.csv",
+    )
+    assert batch.file_sha256 == hashlib.sha256(VALID_CONTENT).hexdigest()
+    assert payload.batch_id == batch.id
+    assert gzip.decompress(payload.csv_gzip) == VALID_CONTENT
+    assert payload.received_size_bytes == len(VALID_CONTENT)
+    assert saved_transactions(session_factory) == {}  # Nothing imported yet.
+
+
+@pytest.mark.parametrize(
+    ("filename", "content", "message"),
+    [
+        ("sales.csv", b"x" * (MAX_SIZE_BYTES + 1), "exceeds the 1000-byte limit"),
+        ("sales.csv", b"", "File is empty."),
+        ("sales.txt", VALID_CONTENT, "File must have a .csv extension."),
+    ],
+    ids=["too-large", "empty", "wrong-extension"],
+)
+def test_enqueue_rejects_unusable_uploads_without_storing(
+    session_factory, filename, content, message
+):
+    outcome = enqueue(session_factory, content, filename)
+
+    assert outcome.status == "INVALID"
+    assert message in outcome.detail
+    assert all_batches(session_factory) == []
+    assert staged_payloads(session_factory) == []
+
+
+def test_enqueue_same_file_twice_stages_it_once(session_factory):
+    enqueue(session_factory)
+
+    outcome = enqueue(session_factory, filename="copy.csv")
+
+    assert outcome.status == "ALREADY UPLOADED"
+    assert len(staged_payloads(session_factory)) == 1
+
+
+def test_worker_imports_staged_batch_and_deletes_its_payload(session_factory):
+    rows = [ROW, row_with(transaction_id="T2", payment_mode="CHEQUE")]
+    enqueue(session_factory, csv_bytes(rows=rows))
+
+    outcome = run_next_batch()
+
+    batch = only_batch(session_factory)
+    assert outcome.status == "IMPORTED"
+    assert (batch.status, batch.attempt_count) == ("COMPLETED", 1)
+    assert (batch.rows_accepted, batch.rows_rejected) == (1, 1)
+    assert list(saved_transactions(session_factory)) == ["T1"]
+    assert saved_row_errors(session_factory, batch)[0][:2] == (3, "payment_mode")
+    assert staged_payloads(session_factory) == []
+
+
+def test_worker_has_nothing_to_do_without_staged_payloads(session_factory):
+    assert run_next_batch() is None
+    enqueue(session_factory)
+    run_next_batch()
+
+    assert run_next_batch() is None
+
+
+def test_worker_rejects_bad_header_and_deletes_payload(session_factory):
+    enqueue(session_factory, csv_bytes(header=HEADER[:-1]))
+
+    outcome = run_next_batch()
+
+    batch = only_batch(session_factory)
+    assert outcome.status == "INVALID"
+    assert batch.status == "REJECTED_HEADER"
+    assert batch.failure_reason == (
+        "Invalid header: missing column(s): original_transaction_id."
+    )
+    assert naive_utc(batch.completed_at) == naive_utc(FIXED_NOW)
+    assert staged_payloads(session_factory) == []
+
+
+@pytest.mark.parametrize(
+    ("content", "reason_start"),
+    [
+        (HEADER_LINE + b"\xff\n", "File is not valid UTF-8"),
+        (HEADER_LINE + b'"unterminated\n', "Malformed CSV near line 2"),
+    ],
+    ids=["bad-encoding", "bad-csv-syntax"],
+)
+def test_worker_fails_unreadable_file_and_deletes_payload(
+    session_factory, content, reason_start
+):
+    enqueue(session_factory, content)
+
+    run_next_batch()
+
+    batch = only_batch(session_factory)
+    assert batch.status == "FAILED"
+    assert batch.failure_reason.startswith(reason_start)
+    assert staged_payloads(session_factory) == []
+
+
+def test_worker_fails_corrupt_payload(session_factory):
+    enqueue(session_factory)
+    with session_factory() as session:
+        session.scalars(select(ImportPayload)).one().csv_gzip = b"not gzip"
+        session.commit()
+
+    run_next_batch()
+
+    batch = only_batch(session_factory)
+    assert (batch.status, batch.failure_reason) == ("FAILED", "Staged file is corrupt.")
+    assert staged_payloads(session_factory) == []
+
+
+def test_database_error_keeps_payload_and_next_run_retries(
+    session_factory, monkeypatch
+):
+    monkeypatch.setattr(csv_validator, "load_import_state", failing_lookups(times=1))
+    enqueue(session_factory)
+
+    first = run_next_batch()
+
+    batch = only_batch(session_factory)
+    assert first.status == "FAILED"
+    assert (batch.status, batch.attempt_count) == ("FAILED", 1)
+    assert batch.failure_reason == (
+        "Database error on attempt 1 of 3; nothing was saved. The worker will retry."
+    )
+    assert saved_transactions(session_factory) == {}
+    assert len(staged_payloads(session_factory)) == 1  # Kept for the retry.
+
+    second = run_next_batch()
+
+    batch = only_batch(session_factory)
+    assert second.status == "IMPORTED"
+    assert (batch.status, batch.attempt_count) == ("COMPLETED", 2)
+    assert list(saved_transactions(session_factory)) == ["T1"]
+    assert staged_payloads(session_factory) == []
+
+
+def test_worker_gives_up_after_max_attempts_and_reupload_requeues(
+    session_factory, monkeypatch
+):
+    monkeypatch.setattr(csv_validator, "load_import_state", failing_lookups(times=3))
+    enqueue(session_factory)
+
+    outcomes = [run_next_batch() for _ in range(4)]
+
+    batch = only_batch(session_factory)
+    assert [o.status if o else None for o in outcomes] == [
+        "FAILED",
+        "FAILED",
+        "FAILED",
+        None,  # Payload removed after the last attempt: nothing left to do.
+    ]
+    assert (batch.status, batch.attempt_count) == ("FAILED", 3)
+    assert batch.failure_reason == (
+        "Database error on all 3 attempts; nothing was saved. "
+        "Upload the same file again to retry."
+    )
+    assert staged_payloads(session_factory) == []
+
+    requeued = enqueue(session_factory)
+
+    assert requeued.status == "QUEUED"
+    assert requeued.detail == f"batch {batch.id} queued again for retry."
+    assert run_next_batch().status == "IMPORTED"
+    assert list(saved_transactions(session_factory)) == ["T1"]
+
+
+def test_worker_takes_oldest_upload_first(session_factory):
+    enqueue(
+        session_factory, csv_bytes(rows=[row_with(transaction_id="NEWER")]), "b.csv"
+    )
+    enqueue(
+        session_factory, csv_bytes(rows=[row_with(transaction_id="OLDER")]), "a.csv"
+    )
+    with session_factory() as session:
+        for batch in session.scalars(select(ImportBatch)):
+            hours_ago = 1 if batch.filename == "b.csv" else 2
+            batch.uploaded_at = FIXED_NOW - timedelta(hours=hours_ago)
+        session.commit()
+
+    run_next_batch()
+
+    assert list(saved_transactions(session_factory)) == ["OLDER"]
+
+
+@pytest.mark.parametrize(
+    ("started_minutes_ago", "reclaimed"),
+    [(61, True), (59, False)],
+    ids=["stale-after-an-hour", "still-running"],
+)
+def test_processing_batch_is_reclaimed_only_when_stale(
+    session_factory, started_minutes_ago, reclaimed
+):
+    enqueue(session_factory)
+    with session_factory() as session:  # As if a worker claimed it, then died.
+        batch = session.scalars(select(ImportBatch)).one()
+        batch.status = "PROCESSING"
+        batch.attempt_count = 1
+        batch.started_at = FIXED_NOW - timedelta(minutes=started_minutes_ago)
+        session.commit()
+
+    outcome = run_next_batch()
+
+    batch = only_batch(session_factory)
+    if reclaimed:
+        assert outcome.status == "IMPORTED"
+        assert (batch.status, batch.attempt_count) == ("COMPLETED", 2)
+    else:
+        assert outcome is None
+        assert batch.status == "PROCESSING"
+        assert len(staged_payloads(session_factory)) == 1
+
+
+def test_run_worker_drain_processes_everything_then_stops(session_factory):
+    enqueue(session_factory, csv_bytes(rows=[row_with(transaction_id="T1")]), "a.csv")
+    enqueue(session_factory, csv_bytes(header=HEADER[:-1]), "bad.csv")
+    enqueue(session_factory, csv_bytes(rows=[row_with(transaction_id="T2")]), "b.csv")
+
+    outcomes = run_worker(drain=True)
+
+    assert sorted(o.status for o in outcomes) == ["IMPORTED", "IMPORTED", "INVALID"]
+    assert sorted(saved_transactions(session_factory)) == ["T1", "T2"]
+    assert staged_payloads(session_factory) == []
+
+
+def test_run_worker_drain_stops_cleanly_when_database_is_down(monkeypatch, capsys):
+    def unavailable():
+        raise OperationalError("connect", {}, Exception("password=secret"))
+
+    monkeypatch.setattr(csv_validator, "SessionLocal", unavailable)
+
+    outcomes = run_worker(drain=True)
+
+    assert [o.status for o in outcomes] == ["ERROR"]
+    assert "password" not in capsys.readouterr().err
+
+
+def test_cli_queue_then_worker_once(tmp_path, capsys, session_factory):
+    day1 = write_file(
+        tmp_path, "day1.csv", csv_bytes(rows=[row_with(transaction_id="T1")])
+    )
+    day2 = write_file(
+        tmp_path, "day2.csv", csv_bytes(rows=[row_with(transaction_id="T2")])
+    )
+
+    assert main(["--queue", str(day1), str(day2)]) == 0
+    queued_output = capsys.readouterr().out
+    assert "Summary: 2 files: 2 queued." in queued_output
+    assert saved_transactions(session_factory) == {}
+    assert len(staged_payloads(session_factory)) == 2
+
+    assert main(["--worker", "--once"]) == 0
+
+    assert "Summary: 2 files: 2 imported." in capsys.readouterr().out
+    assert sorted(saved_transactions(session_factory)) == ["T1", "T2"]
+    assert staged_payloads(session_factory) == []
+    assert {b.status for b in all_batches(session_factory)} == {"COMPLETED"}
+
+
+def test_cli_queue_reports_invalid_file_and_queues_the_rest(
+    tmp_path, capsys, session_factory
+):
+    good = write_file(tmp_path, "good.csv")
+    wrong_type = write_file(tmp_path, "notes.txt")
+
+    exit_code = main(["--queue", str(good), str(wrong_type)])
+
+    assert exit_code == 1
+    assert len(staged_payloads(session_factory)) == 1
+    assert "Summary: 2 files: 1 queued, 1 invalid." in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["--worker", "a.csv"], ["--once", "a.csv"], ["--queue"], ["--queue", "--worker"]],
+    ids=[
+        "worker-with-paths",
+        "once-without-worker",
+        "queue-without-paths",
+        "both-modes",
+    ],
+)
+def test_cli_rejects_invalid_flag_combinations(argv):
+    with pytest.raises(SystemExit) as excinfo:
+        main(argv)
+
+    assert excinfo.value.code == 2
+
+
+def test_cli_worker_stops_cleanly_on_ctrl_c(monkeypatch, capsys):
+    def interrupted(**kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(csv_validator, "run_worker", interrupted)
+
+    assert main(["--worker"]) == 0
+    assert capsys.readouterr().out == "Worker stopped.\n"

@@ -14,7 +14,13 @@ import_row_errors, valid rows go to transactions, and the batch gets its counts
 and final status.
 
 Usage (from backend/):
-    python -m app.services.csv_validator sales.csv [more.csv ...]
+    python -m app.services.csv_validator sales.csv [more.csv ...]   # import now
+    python -m app.services.csv_validator --queue sales.csv [...]     # stage only
+    python -m app.services.csv_validator --worker [--once]           # import staged
+
+--queue stores each file gzipped in import_payloads with a QUEUED batch and
+returns at once. --worker imports staged batches oldest first and deletes each
+payload in the same commit as the imported rows (--once: stop when idle).
 
 Each file is handled on its own: an invalid, duplicate or failing file is
 reported and the remaining files are still imported. With two or more files a
@@ -23,17 +29,19 @@ summary is printed at the end. The exit code is 0 only if every file imported.
 
 import argparse
 import csv
+import gzip
 import hashlib
 import io
 import logging
 import sys
+import time
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -41,6 +49,7 @@ from app.config import get_settings
 from app.database import SessionLocal
 from app.models import (
     ImportBatch,
+    ImportPayload,
     ImportRowError,
     Product,
     ProductAlias,
@@ -60,6 +69,12 @@ from app.services.sales_rules import (
 logger = logging.getLogger(__name__)
 
 LOOKUP_CHUNK_SIZE = 1000
+# Worker settings: a database error is retried this many times in total, and a
+# batch left PROCESSING this long (its worker died) may be claimed again.
+MAX_IMPORT_ATTEMPTS = 3
+STALE_PROCESSING_AFTER = timedelta(hours=1)
+WORKER_POLL_INTERVAL_SECONDS = 5.0
+GZIP_LEVEL = 6  # Good compression for CSV text at a fraction of level 9's cost.
 
 REQUIRED_HEADERS = (
     "transaction_id",
@@ -106,22 +121,41 @@ class FileCheckResult:
     row_errors: tuple[RowError, ...] = ()
     # SHA-256 of the original file bytes (BOM included); None unless valid.
     sha256: str | None = None
+    # True when the header row was the problem (batch status REJECTED_HEADER).
+    is_header_problem: bool = False
 
 
 class CsvFileError(Exception):
     """A problem that makes the whole file unusable."""
 
 
+class CsvHeaderError(CsvFileError):
+    """The header row is missing or wrong."""
+
+
 def check_csv_file(path: Path, max_size_bytes: int) -> FileCheckResult:
     try:
         content = read_file(path, max_size_bytes)
+    except CsvFileError as error:
+        return FileCheckResult(path, is_valid=False, message=str(error))
+    return check_csv_content(path, content)
+
+
+def check_csv_content(path: Path, content: bytes) -> FileCheckResult:
+    """Encoding, CSV syntax, header and row checks on bytes already in memory."""
+    try:
         text = decode_utf8(content)
         header, *records = parse_records(text)
         header_problem = find_header_problem(header)
         if header_problem:
-            raise CsvFileError(header_problem)
+            raise CsvHeaderError(header_problem)
     except CsvFileError as error:
-        return FileCheckResult(path, is_valid=False, message=str(error))
+        return FileCheckResult(
+            path,
+            is_valid=False,
+            message=str(error),
+            is_header_problem=isinstance(error, CsvHeaderError),
+        )
 
     rows, row_errors = validate_rows(header, records)
     return FileCheckResult(
@@ -139,23 +173,26 @@ def read_file(path: Path, max_size_bytes: int) -> bytes:
         raise CsvFileError("File does not exist.")
     if not path.is_file():
         raise CsvFileError("Path is not a regular file.")
-    if path.suffix.lower() != ".csv":
-        raise CsvFileError("File must have a .csv extension.")
 
     try:
-        size_bytes = path.stat().st_size
         # Size is checked before reading so oversized files are never loaded.
-        if size_bytes == 0:
-            raise CsvFileError("File is empty.")
-        if size_bytes > max_size_bytes:
-            raise CsvFileError(
-                f"File is {size_bytes} bytes, which exceeds the {max_size_bytes}-byte limit."
-            )
+        check_name_and_size(path, path.stat().st_size, max_size_bytes)
         return path.read_bytes()
     except OSError as error:
         raise CsvFileError(
             f"File cannot be read ({error.strerror or 'unknown error'})."
         ) from error
+
+
+def check_name_and_size(path: Path, size_bytes: int, max_size_bytes: int) -> None:
+    if path.suffix.lower() != ".csv":
+        raise CsvFileError("File must have a .csv extension.")
+    if size_bytes == 0:
+        raise CsvFileError("File is empty.")
+    if size_bytes > max_size_bytes:
+        raise CsvFileError(
+            f"File is {size_bytes} bytes, which exceeds the {max_size_bytes}-byte limit."
+        )
 
 
 def decode_utf8(content: bytes) -> str:
@@ -266,11 +303,12 @@ def describe_unexpected(name: str) -> str:
 
 
 IMPORTED = "IMPORTED"
+QUEUED = "QUEUED"
 INVALID = "INVALID"
 ALREADY_UPLOADED = "ALREADY UPLOADED"
 FAILED = "FAILED"
 ERROR = "ERROR"
-SUMMARY_ORDER = (IMPORTED, INVALID, ALREADY_UPLOADED, FAILED, ERROR)
+SUMMARY_ORDER = (IMPORTED, QUEUED, INVALID, ALREADY_UPLOADED, FAILED, ERROR)
 
 
 @dataclass(frozen=True)
@@ -285,15 +323,45 @@ def main(argv: list[str] | None = None) -> int:
         description="Validate sales CSV files and import their rows."
     )
     parser.add_argument(
-        "paths", nargs="+", type=Path, metavar="path", help="CSV file(s) to import"
+        "paths", nargs="*", type=Path, metavar="path", help="CSV file(s) to import"
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--queue",
+        action="store_true",
+        help="stage the files for the worker and return immediately",
+    )
+    mode.add_argument(
+        "--worker", action="store_true", help="import staged files as they arrive"
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="with --worker: import everything staged, then exit",
     )
     args = parser.parse_args(argv)
+    if args.worker and args.paths:
+        parser.error("--worker takes no file paths")
+    if not args.worker and not args.paths:
+        parser.error("at least one file path is required")
+    if args.once and not args.worker:
+        parser.error("--once only works with --worker")
 
-    max_size_bytes = get_settings().max_upload_size_bytes
-    outcomes = [import_file(path, max_size_bytes) for path in args.paths]
+    if args.worker:
+        try:
+            outcomes = run_worker(drain=args.once)
+        except KeyboardInterrupt:
+            print("Worker stopped.")
+            return 0
+        expected = IMPORTED
+    else:
+        max_size_bytes = get_settings().max_upload_size_bytes
+        handle = queue_file if args.queue else import_file
+        outcomes = [handle(path, max_size_bytes) for path in args.paths]
+        expected = QUEUED if args.queue else IMPORTED
     if len(outcomes) > 1:
         print_summary(outcomes)
-    return 0 if all(outcome.status == IMPORTED for outcome in outcomes) else 1
+    return 0 if all(outcome.status == expected for outcome in outcomes) else 1
 
 
 def import_file(path: Path, max_size_bytes: int) -> FileOutcome:
@@ -360,18 +428,26 @@ def register_import_batch(
     return BatchRegistration(batch, is_new=True)
 
 
+def is_claimable():
+    """QUEUED or FAILED batches, or PROCESSING ones whose worker has died."""
+    return or_(
+        ImportBatch.status.in_(("QUEUED", "FAILED")),
+        and_(
+            ImportBatch.status == "PROCESSING",
+            ImportBatch.started_at < utc_now() - STALE_PROCESSING_AFTER,
+        ),
+    )
+
+
 def claim_batch(session: Session, batch: ImportBatch) -> bool:
-    """Move a QUEUED or FAILED batch to PROCESSING; False if someone else has it.
+    """Move a claimable batch to PROCESSING; False if someone else has it.
 
     The status condition in the UPDATE makes the claim atomic, so two
     processes can never import the same batch at once.
     """
     claimed = session.execute(
         update(ImportBatch)
-        .where(
-            ImportBatch.id == batch.id,
-            ImportBatch.status.in_(("QUEUED", "FAILED")),
-        )
+        .where(ImportBatch.id == batch.id, is_claimable())
         .values(
             status="PROCESSING",
             started_at=utc_now(),
@@ -379,6 +455,9 @@ def claim_batch(session: Session, batch: ImportBatch) -> bool:
             failure_reason=None,
             attempt_count=ImportBatch.attempt_count + 1,
         )
+        # Skip re-evaluating the WHERE in Python on loaded objects; the batch is
+        # refreshed from the database below instead.
+        .execution_options(synchronize_session=False)
     )
     session.commit()
     session.refresh(batch)
@@ -779,6 +858,12 @@ def record_batch(result: FileCheckResult) -> FileOutcome:
         print(f"Batch {batch.id} FAILED: {batch.failure_reason}", file=sys.stderr)
         return FileOutcome(result.path, FAILED, batch.failure_reason or "")
 
+    return report_completed(result.path, batch, errors)
+
+
+def report_completed(
+    path: Path, batch: ImportBatch, errors: list[RowError]
+) -> FileOutcome:
     print(
         f"Batch {batch.id} COMPLETED: {batch.rows_total} rows, "
         f"{batch.rows_accepted} accepted, {batch.rows_rejected} rejected."
@@ -786,11 +871,209 @@ def record_batch(result: FileCheckResult) -> FileOutcome:
     for error in errors:
         print(f"Row {error.row_number} [{error.column_name}]: {error.message}")
     return FileOutcome(
-        result.path,
+        path,
         IMPORTED,
         f"batch {batch.id}: {batch.rows_accepted} accepted, "
         f"{batch.rows_rejected} rejected.",
     )
+
+
+# Staged uploads and the background worker
+
+
+def queue_file(path: Path, max_size_bytes: int) -> FileOutcome:
+    """Stage one file from disk for the worker; never raises (see import_file)."""
+    try:
+        content = read_file(path, max_size_bytes)
+    except CsvFileError as error:
+        print(f"INVALID {path}: {error}", file=sys.stderr)
+        return FileOutcome(path, INVALID, str(error))
+    try:
+        with SessionLocal() as session:
+            outcome = enqueue_upload(session, path.name, content, max_size_bytes)
+    except SQLAlchemyError:
+        logger.exception("Could not queue %s", path)
+        outcome = FileOutcome(
+            path, ERROR, "could not queue the file (database unavailable)."
+        )
+    except Exception:
+        logger.exception("Unexpected error while queueing %s", path)
+        outcome = FileOutcome(path, ERROR, "unexpected error (details are in the log)")
+    outcome = replace(outcome, path=path)
+    stream = sys.stdout if outcome.status == QUEUED else sys.stderr
+    print(f"{outcome.status} {path}: {outcome.detail}", file=stream)
+    return outcome
+
+
+def enqueue_upload(
+    session: Session, filename: str, content: bytes, max_size_bytes: int
+) -> FileOutcome:
+    """Stage an upload: a QUEUED batch plus its gzipped bytes, in one commit.
+
+    Only cheap checks run here (extension, empty, size), so the caller returns
+    at once; the worker does the parsing and importing. A file that already
+    failed permanently (its payload was removed) is staged again for a retry.
+    """
+    path = Path(filename)
+    try:
+        check_name_and_size(path, len(content), max_size_bytes)
+    except CsvFileError as error:
+        return FileOutcome(path, INVALID, str(error))
+
+    registration = register_import_batch(
+        session, filename=path.name, file_sha256=hashlib.sha256(content).hexdigest()
+    )
+    batch = registration.batch
+    retry = (
+        not registration.is_new
+        and batch.status == "FAILED"
+        and session.get(ImportPayload, batch.id) is None
+    )
+    if not (registration.is_new or retry):
+        return FileOutcome(
+            path,
+            ALREADY_UPLOADED,
+            f"this file was already uploaded as '{batch.filename}' "
+            f"(batch {batch.id}, status {batch.status}).",
+        )
+
+    session.add(
+        ImportPayload(
+            batch_id=batch.id,
+            csv_gzip=gzip.compress(content, compresslevel=GZIP_LEVEL),
+            received_size_bytes=len(content),
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:  # Another upload of the same file staged it first.
+        session.rollback()
+        return FileOutcome(
+            path, ALREADY_UPLOADED, f"this file is already queued (batch {batch.id})."
+        )
+    action = "queued again for retry" if retry else "queued"
+    return FileOutcome(path, QUEUED, f"batch {batch.id} {action}.")
+
+
+def run_worker(
+    *, drain: bool, poll_interval_seconds: float = WORKER_POLL_INTERVAL_SECONDS
+) -> list[FileOutcome]:
+    """Import staged batches one at a time, oldest first.
+
+    With drain=True, stop when nothing is left (or the database is down);
+    otherwise keep polling until interrupted (Ctrl+C).
+    """
+    outcomes = []
+    while True:
+        try:
+            outcome = run_next_batch()
+        except SQLAlchemyError:
+            logger.exception("Worker could not reach the database")
+            print("ERROR worker: database unavailable.", file=sys.stderr)
+            if drain:
+                return [
+                    *outcomes,
+                    FileOutcome(Path("-"), ERROR, "database unavailable."),
+                ]
+            outcome = None
+        if outcome is not None:
+            outcomes.append(outcome)
+        elif drain:
+            return outcomes
+        else:
+            time.sleep(poll_interval_seconds)
+
+
+def run_next_batch() -> FileOutcome | None:
+    """Claim the oldest batch with a staged payload and import it; None if idle."""
+    with SessionLocal() as session:
+        batch = claim_next_batch(session)
+        if batch is None:
+            return None
+        return import_staged_batch(session, batch)
+
+
+def claim_next_batch(session: Session) -> ImportBatch | None:
+    # Only batches with a payload have work left. Several candidates are tried
+    # because another worker may claim the first one between SELECT and UPDATE.
+    candidates = session.scalars(
+        select(ImportBatch)
+        .join(ImportPayload, ImportPayload.batch_id == ImportBatch.id)
+        .where(is_claimable())
+        .order_by(ImportBatch.uploaded_at, ImportBatch.id)
+        .limit(10)
+    ).all()
+    session.commit()  # End the read so the claims below start fresh.
+    for batch in candidates:
+        if claim_batch(session, batch):
+            return batch
+    return None
+
+
+def import_staged_batch(session: Session, batch: ImportBatch) -> FileOutcome:
+    path = Path(batch.filename)
+    payload = session.get(ImportPayload, batch.id)
+    if payload is None:  # Removed after this batch was claimed; nothing to do.
+        return finish_without_import(
+            session, batch, None, "FAILED", "Staged file is missing."
+        )
+    try:
+        content = gzip.decompress(payload.csv_gzip)
+    except (OSError, EOFError):  # gzip.BadGzipFile is an OSError.
+        return finish_without_import(
+            session, batch, payload, "FAILED", "Staged file is corrupt."
+        )
+
+    result = check_csv_content(path, content)
+    if not result.is_valid:
+        status = "REJECTED_HEADER" if result.is_header_problem else "FAILED"
+        return finish_without_import(session, batch, payload, status, result.message)
+
+    # Deleted in the same transaction that saves the rows: on success both are
+    # committed together; on a database error the rollback keeps the payload.
+    session.delete(payload)
+    errors = process_batch(session, batch, result)
+    if batch.status == "COMPLETED":
+        return report_completed(path, batch, errors)
+    return schedule_retry_or_give_up(session, batch)
+
+
+def schedule_retry_or_give_up(session: Session, batch: ImportBatch) -> FileOutcome:
+    attempts = batch.attempt_count
+    if attempts < MAX_IMPORT_ATTEMPTS:
+        batch.failure_reason = (
+            f"Database error on attempt {attempts} of {MAX_IMPORT_ATTEMPTS}; "
+            "nothing was saved. The worker will retry."
+        )
+    else:
+        payload = session.get(ImportPayload, batch.id)
+        if payload is not None:
+            session.delete(payload)
+        batch.failure_reason = (
+            f"Database error on all {MAX_IMPORT_ATTEMPTS} attempts; nothing was "
+            "saved. Upload the same file again to retry."
+        )
+    session.commit()
+    print(f"Batch {batch.id} FAILED: {batch.failure_reason}", file=sys.stderr)
+    return FileOutcome(Path(batch.filename), FAILED, batch.failure_reason)
+
+
+def finish_without_import(
+    session: Session,
+    batch: ImportBatch,
+    payload: ImportPayload | None,
+    status: str,
+    reason: str,
+) -> FileOutcome:
+    """End a batch whose file can never import: retrying the same bytes won't help."""
+    if payload is not None:
+        session.delete(payload)
+    batch.status = status
+    batch.failure_reason = reason
+    batch.completed_at = utc_now()
+    session.commit()
+    print(f"Batch {batch.id} {status}: {reason}", file=sys.stderr)
+    return FileOutcome(Path(batch.filename), INVALID, reason)
 
 
 if __name__ == "__main__":
