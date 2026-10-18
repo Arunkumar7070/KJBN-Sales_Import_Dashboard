@@ -1008,10 +1008,19 @@ def test_boundary_values_are_accepted(tmp_path, session_factory, changes):
     assert list(saved_transactions(session_factory)) == ["T1"]
 
 
+# An hour after ROW's 09:00 sale, so returns pass the strictly-after rule.
+LATER = "2026-10-17 10:00:00"
+
+
 def test_return_of_sale_in_same_file_is_saved(tmp_path, session_factory):
     rows = [
         row_with(transaction_id="T1", quantity="5"),
-        row_with(transaction_id="R1", quantity="-2", original_transaction_id="T1"),
+        row_with(
+            transaction_id="R1",
+            sold_at=LATER,
+            quantity="-2",
+            original_transaction_id="T1",
+        ),
     ]
 
     import_csv(tmp_path, rows)
@@ -1032,7 +1041,12 @@ def test_cumulative_returns_across_files_cannot_exceed_sale(tmp_path, session_fa
         tmp_path,
         [
             row_with(transaction_id="T1", quantity="5"),
-            row_with(transaction_id="R1", quantity="-3", original_transaction_id="T1"),
+            row_with(
+                transaction_id="R1",
+                sold_at=LATER,
+                quantity="-3",
+                original_transaction_id="T1",
+            ),
         ],
         name="day1.csv",
     )
@@ -1040,8 +1054,18 @@ def test_cumulative_returns_across_files_cannot_exceed_sale(tmp_path, session_fa
     import_csv(
         tmp_path,
         [
-            row_with(transaction_id="R2", quantity="-2", original_transaction_id="T1"),
-            row_with(transaction_id="R3", quantity="-1", original_transaction_id="T1"),
+            row_with(
+                transaction_id="R2",
+                sold_at=LATER,
+                quantity="-2",
+                original_transaction_id="T1",
+            ),
+            row_with(
+                transaction_id="R3",
+                sold_at=LATER,
+                quantity="-1",
+                original_transaction_id="T1",
+            ),
         ],
         name="day2.csv",
     )
@@ -1089,7 +1113,7 @@ def test_invalid_returns_are_rejected(
     tmp_path, session_factory, return_changes, column, message
 ):
     return_row = row_with(
-        transaction_id="R1", quantity="-1", original_transaction_id="T1"
+        transaction_id="R1", sold_at=LATER, quantity="-1", original_transaction_id="T1"
     )
     return_row = [
         return_changes.get(name, value)
@@ -1130,7 +1154,18 @@ def test_return_listed_before_its_sale_is_accepted(tmp_path, session_factory):
     assert (batch.rows_accepted, batch.rows_rejected) == (2, 0)
 
 
-def test_sale_is_processed_before_return_at_the_same_time(tmp_path, session_factory):
+def before_sale_message(return_time, sale_time):
+    return (
+        f"Return sold_at ({return_time}) must be after the original "
+        f"sale's sold_at ({sale_time})."
+    )
+
+
+def test_return_at_same_time_as_sale_is_rejected_as_before_sale(
+    tmp_path, session_factory
+):
+    # The sale is processed first (sales before returns at equal times), so the
+    # return finds it and fails the strictly-after rule, not "not found".
     same_time = "2026-10-17 09:00:00"
     rows = [
         a_return("R1", same_time),
@@ -1139,7 +1174,32 @@ def test_sale_is_processed_before_return_at_the_same_time(tmp_path, session_fact
 
     import_csv(tmp_path, rows)
 
-    assert sorted(saved_transactions(session_factory)) == ["R1", "T1"]
+    assert list(saved_transactions(session_factory)) == ["T1"]
+    assert saved_row_errors(session_factory, only_batch(session_factory)) == [
+        (
+            2,
+            "sold_at",
+            before_sale_message("2026-10-17 09:00:00", "2026-10-17 09:00:00"),
+            "R1",
+        )
+    ]
+
+
+def test_return_before_sale_from_earlier_file_is_rejected(tmp_path, session_factory):
+    import_csv(tmp_path, [row_with(transaction_id="T1")], name="day1.csv")
+
+    import_csv(tmp_path, [a_return("R1", "2026-10-17 08:00:00")], name="day2.csv")
+
+    assert list(saved_transactions(session_factory)) == ["T1"]
+    errors = saved_row_errors(session_factory, batch_named(session_factory, "day2.csv"))
+    assert errors == [
+        (
+            2,
+            "sold_at",
+            before_sale_message("2026-10-17 08:00:00", "2026-10-17 09:00:00"),
+            "R1",
+        )
+    ]
 
 
 def test_errors_keep_original_csv_row_numbers_after_sorting(tmp_path, session_factory):

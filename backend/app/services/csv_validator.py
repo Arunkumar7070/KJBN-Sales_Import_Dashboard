@@ -25,7 +25,7 @@ import logging
 import sys
 from collections import Counter
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -563,7 +563,7 @@ def load_import_state(session: Session, rows: Sequence[CsvRow]) -> ImportState:
             )
         },
         originals={
-            row[0]: SaleRow(*row)
+            row[0]: sale_row_from_database(row)
             for row in fetch_where_in(
                 session, original_columns, Transaction.transaction_id, original_ids
             )
@@ -579,6 +579,15 @@ def load_import_state(session: Session, rows: Sequence[CsvRow]) -> ImportState:
             )
         ),
     )
+
+
+def sale_row_from_database(row) -> SaleRow:
+    sale = SaleRow(*row)
+    # sold_at is stored in UTC, but some drivers (e.g. SQLite) drop the
+    # timezone on read; restore it so it compares with parsed CSV times.
+    if sale.sold_at.tzinfo is None:
+        return replace(sale, sold_at=sale.sold_at.replace(tzinfo=UTC))
+    return sale
 
 
 def fetch_where_in(session: Session, statement, column, values: set[str]) -> list:

@@ -198,6 +198,40 @@ def test_return_of_different_sku_is_rejected(assert_rejected):
     )
 
 
+# Return timing (original sale was sold at FIXED_NOW - 1 day)
+
+SALE_TIME = ORIGINAL_SALE["sold_at"]
+
+
+def test_return_just_after_sale_is_accepted(validate):
+    just_after = SALE_TIME + timedelta(microseconds=1)
+
+    validate(return_of(-1, sold_at=just_after), original=ORIGINAL_SALE)
+
+
+@pytest.mark.parametrize(
+    "sold_at",
+    [SALE_TIME, SALE_TIME - timedelta(microseconds=1), SALE_TIME - timedelta(days=1)],
+    ids=["same-moment", "just-before", "day-before"],
+)
+def test_return_at_or_before_sale_is_rejected(assert_rejected, sold_at):
+    assert_rejected(
+        "RETURN_BEFORE_SALE", return_of(-1, sold_at=sold_at), original=ORIGINAL_SALE
+    )
+
+
+def test_return_before_sale_message_shows_both_times_in_ist(rules, validate):
+    with pytest.raises(rules.SaleRuleViolation) as excinfo:
+        validate(return_of(-1, sold_at=SALE_TIME), original=ORIGINAL_SALE)
+
+    # FIXED_NOW - 1 day is 2026-10-16 10:00 UTC = 15:30 IST.
+    assert excinfo.value.message == (
+        "Return sold_at (2026-10-16 15:30:00) must be after the original sale's "
+        "sold_at (2026-10-16 15:30:00)."
+    )
+    assert excinfo.value.column_name == "sold_at"
+
+
 # Cumulative return quantity (original sale quantity = 5)
 
 

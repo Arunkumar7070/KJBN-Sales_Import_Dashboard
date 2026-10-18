@@ -11,8 +11,9 @@ Rules:
   with up to 2 decimals, stored as integer paise.
 - payment_mode is exactly CASH, UPI or CARD.
 - A return has a discount of exactly 0.00, references an existing positive
-  sale with the same store and SKU, and total returned quantity never exceeds
-  the sale quantity. A sale must not reference an original transaction.
+  sale with the same store and SKU, is sold strictly after that sale, and total
+  returned quantity never exceeds the sale quantity. A sale must not reference
+  an original transaction.
 - line total = quantity * unit_price - discount.
 """
 
@@ -47,6 +48,7 @@ COLUMN_BY_CODE = {
     "RETURN_STORE_MISMATCH": "store_code",
     "RETURN_SKU_MISMATCH": "sku",
     "RETURN_DISCOUNT_NOT_ZERO": "discount",
+    "RETURN_BEFORE_SALE": "sold_at",
     "RETURN_QUANTITY_EXCEEDS_ORIGINAL": "quantity",
     "DUPLICATE_IN_FILE": "transaction_id",
     "DUPLICATE_IN_DATABASE": "transaction_id",
@@ -201,6 +203,12 @@ def validate_return(
             "RETURN_ORIGINAL_NOT_A_SALE",
             f"Original transaction '{original_id}' is not a sale.",
         )
+    if row.sold_at <= original.sold_at:
+        raise SaleRuleViolation(
+            "RETURN_BEFORE_SALE",
+            f"Return sold_at ({format_ist(row.sold_at)}) must be after the original "
+            f"sale's sold_at ({format_ist(original.sold_at)}).",
+        )
     if row.store_code != original.store_code:
         raise SaleRuleViolation(
             "RETURN_STORE_MISMATCH",
@@ -220,6 +228,11 @@ def validate_return(
             f"Returning {abs(row.quantity)} would bring total returns to "
             f"{returned_after}, more than the {original.quantity} originally sold.",
         )
+
+
+def format_ist(moment: datetime) -> str:
+    # Shown in IST, the same format the CSV uses.
+    return moment.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def format_rupees(paise: int) -> str:
