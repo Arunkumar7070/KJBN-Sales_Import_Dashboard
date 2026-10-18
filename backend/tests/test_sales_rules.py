@@ -5,8 +5,8 @@ Rules (agreed before implementation):
 - 0 <= discount_paise <= unit_price_paise * abs(quantity).
 - sold_at must not be after the clock's current time (equal is allowed).
 - payment_mode must be exactly CASH, UPI or CARD (no trimming or case folding).
-- A return must reference an original transaction that exists, is a positive
-  sale, and has the same store and SKU.
+- A return must have a discount of exactly 0 and must reference an original
+  transaction that exists, is a positive sale, and has the same store and SKU.
 - Total returned quantity against an original must not exceed its quantity.
 
 The module under test, app.services.sales_rules, is imported lazily so every
@@ -106,8 +106,23 @@ def test_negative_discount_is_rejected(assert_rejected):
     assert_rejected("INVALID_DISCOUNT", sale(discount_paise=-1))
 
 
-def test_return_discount_limit_uses_absolute_quantity(validate):
-    validate(return_of(-2, discount_paise=20000), original=ORIGINAL_SALE)
+def test_return_with_zero_discount_is_accepted(validate):
+    validate(return_of(-2, discount_paise=0), original=ORIGINAL_SALE)
+
+
+@pytest.mark.parametrize("discount_paise", [1, 5000, 20000])
+def test_return_with_any_positive_discount_is_rejected(assert_rejected, discount_paise):
+    assert_rejected(
+        "RETURN_DISCOUNT_NOT_ZERO",
+        return_of(-2, discount_paise=discount_paise),
+        original=ORIGINAL_SALE,
+    )
+
+
+def test_negative_discount_on_return_is_still_invalid_discount(assert_rejected):
+    assert_rejected(
+        "INVALID_DISCOUNT", return_of(-2, discount_paise=-1), original=ORIGINAL_SALE
+    )
 
 
 # Timestamp

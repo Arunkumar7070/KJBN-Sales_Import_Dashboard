@@ -10,9 +10,9 @@ Rules:
 - unit_price >= 0 and 0 <= discount <= unit_price * abs(quantity), in rupees
   with up to 2 decimals, stored as integer paise.
 - payment_mode is exactly CASH, UPI or CARD.
-- A return references an existing positive sale with the same store and SKU,
-  and total returned quantity never exceeds the sale quantity. A sale must not
-  reference an original transaction.
+- A return has a discount of exactly 0.00, references an existing positive
+  sale with the same store and SKU, and total returned quantity never exceeds
+  the sale quantity. A sale must not reference an original transaction.
 - line total = quantity * unit_price - discount.
 """
 
@@ -46,6 +46,7 @@ COLUMN_BY_CODE = {
     "RETURN_ORIGINAL_NOT_A_SALE": "original_transaction_id",
     "RETURN_STORE_MISMATCH": "store_code",
     "RETURN_SKU_MISMATCH": "sku",
+    "RETURN_DISCOUNT_NOT_ZERO": "discount",
     "RETURN_QUANTITY_EXCEEDS_ORIGINAL": "quantity",
     "DUPLICATE_IN_FILE": "transaction_id",
     "DUPLICATE_IN_DATABASE": "transaction_id",
@@ -178,6 +179,12 @@ def validate_amounts(row: SaleRow) -> None:
 def validate_return(
     row: SaleRow, original: SaleRow | None, already_returned_quantity: int
 ) -> None:
+    if row.discount_paise != 0:
+        raise SaleRuleViolation(
+            "RETURN_DISCOUNT_NOT_ZERO",
+            f"A return must have a discount of 0.00; got "
+            f"{format_rupees(row.discount_paise)}.",
+        )
     original_id = row.original_transaction_id
     if not original_id:
         raise SaleRuleViolation(
