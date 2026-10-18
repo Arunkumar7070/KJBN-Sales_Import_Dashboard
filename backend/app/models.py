@@ -9,6 +9,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    LargeBinary,
     Text,
     UniqueConstraint,
     Uuid,
@@ -85,6 +86,7 @@ class ImportBatch(Base):
 
     transactions: Mapped[list["Transaction"]] = relationship(back_populates="batch")
     row_errors: Mapped[list["ImportRowError"]] = relationship(back_populates="batch")
+    payload: Mapped["ImportPayload | None"] = relationship(back_populates="batch")
 
 
 class ImportRowError(Base):
@@ -105,6 +107,29 @@ class ImportRowError(Base):
     transaction_id: Mapped[str | None] = mapped_column(Text)
 
     batch: Mapped[ImportBatch] = relationship(back_populates="row_errors")
+
+
+class ImportPayload(Base):
+    """An uploaded CSV staged for a background worker; survives process restarts."""
+
+    __tablename__ = "import_payloads"
+    __table_args__ = (
+        CheckConstraint(
+            "received_size_bytes >= 0", name="ck_import_payloads_received_size_bytes"
+        ),
+    )
+
+    # Primary key and foreign key at once: at most one payload per batch.
+    batch_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("import_batches.id"), primary_key=True
+    )
+    csv_gzip: Mapped[bytes] = mapped_column(LargeBinary)  # gzip of original bytes
+    received_size_bytes: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    batch: Mapped[ImportBatch] = relationship(back_populates="payload")
 
 
 class Transaction(Base):
