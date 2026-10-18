@@ -1,14 +1,23 @@
 import hashlib
 import os
+from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import BigInteger, create_engine, select
 from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from app.config import Settings
 from app.database import Base
-from app.models import ImportBatch
+from app.models import (
+    ImportBatch,
+    ImportRowError,
+    Product,
+    ProductAlias,
+    Store,
+    Transaction,
+)
 from app.services import csv_validator
 from app.services.csv_validator import (
     CsvRow,
@@ -37,7 +46,7 @@ HEADER = [
 ROW = [
     "T1",
     "ST01",
-    "2026-10-17T09:00:00Z",
+    "2026-10-17 09:00:00",
     "SKU1",
     "Masala Chai",
     "2",
@@ -47,6 +56,15 @@ ROW = [
     "",
 ]
 EXPECTED_ROW = dict(zip(HEADER, ROW, strict=True))
+# 17:30 IST on the same day as ROW's sale, so every test row is in the past.
+FIXED_NOW = datetime(2026, 10, 17, 12, 0, tzinfo=UTC)
+
+
+@compiles(BigInteger, "sqlite")
+def bigint_as_sqlite_integer(type_, compiler, **kwargs):
+    # Only "INTEGER PRIMARY KEY" auto-increments in SQLite (PostgreSQL uses
+    # BIGSERIAL). SQLite INTEGER is 64-bit, so money values are unaffected.
+    return "INTEGER"
 
 
 @pytest.fixture(autouse=True)
@@ -56,7 +74,16 @@ def session_factory(monkeypatch):
     engine = create_engine("sqlite://", connect_args={"autocommit": False})
     Base.metadata.create_all(engine)
     factory = sessionmaker(engine, expire_on_commit=False)
+    with factory() as session:
+        session.add_all(
+            [
+                Store(code="ST01", name="Store One", city="Chennai"),
+                Store(code="ST02", name="Store Two", city="Madurai"),
+            ]
+        )
+        session.commit()
     monkeypatch.setattr(csv_validator, "SessionLocal", factory)
+    monkeypatch.setattr(csv_validator, "utc_now", lambda: FIXED_NOW)
     yield factory
     engine.dispose()
 
@@ -415,8 +442,7 @@ def test_cli_prints_hash_for_valid_file(tmp_path, capsys, session_factory):
     assert exit_code == 0
     assert output.out == (
         f"{hashlib.sha256(VALID_CONTENT).hexdigest()}  {path}\n"
-        "Rows: 1 valid, 0 invalid.\n"
-        f"Created import batch {batch.id} with status QUEUED.\n"
+        f"Batch {batch.id} COMPLETED: 1 rows, 1 accepted, 0 rejected.\n"
     )
     assert output.err == ""
 
@@ -534,7 +560,7 @@ def test_cli_reports_already_uploaded_file(tmp_path, capsys, session_factory):
     assert exit_code == 1
     assert output.err == (
         f"ALREADY UPLOADED {copy}: this file was already uploaded as "
-        f"'sales.csv' (batch {batch.id}, status QUEUED).\n"
+        f"'sales.csv' (batch {batch.id}, status COMPLETED).\n"
     )
     assert only_batch(session_factory).id == batch.id
 
@@ -557,9 +583,7 @@ def test_cli_reports_database_failure_cleanly(tmp_path, capsys, monkeypatch):
 
     err = capsys.readouterr().err
     assert exit_code == 1
-    assert err == (
-        f"ERROR {path}: could not record the import batch (database unavailable).\n"
-    )
+    assert err == (f"ERROR {path}: could not import the file (database unavailable).\n")
 
 
 # Row-by-row validation
@@ -722,7 +746,7 @@ def test_missing_value_is_found_by_name_in_reordered_columns(tmp_path):
     )
 
 
-def test_cli_lists_invalid_rows_and_still_creates_batch(
+def test_cli_lists_invalid_rows_and_still_imports_valid_ones(
     tmp_path, capsys, session_factory
 ):
     rows = [ROW, row_with(transaction_id="T2", sku=""), ROW[:9]]
@@ -731,11 +755,492 @@ def test_cli_lists_invalid_rows_and_still_creates_batch(
     exit_code = main([str(path)])
 
     out = capsys.readouterr().out.splitlines()
+    batch = only_batch(session_factory)
     assert exit_code == 0
-    assert out[1:4] == [
-        "Rows: 1 valid, 2 invalid.",
-        "Row 3: Missing required value(s): sku.",
-        "Row 4: Row has 9 column(s); expected 10.",
+    assert out[1:] == [
+        f"Batch {batch.id} COMPLETED: 3 rows, 1 accepted, 2 rejected.",
+        "Row 3 [sku]: Missing required value(s): sku.",
+        "Row 4 [__row__]: Row has 9 column(s); expected 10.",
     ]
-    assert out[4].startswith("Created import batch")
-    assert only_batch(session_factory).status == "QUEUED"
+
+
+# Importing rows into the database
+
+
+def import_csv(tmp_path, rows, name="sales.csv"):
+    path = write_file(tmp_path, name, csv_bytes(rows=rows))
+    return main([str(path)])
+
+
+def batch_named(session_factory, filename):
+    with session_factory() as session:
+        return session.scalars(
+            select(ImportBatch).where(ImportBatch.filename == filename)
+        ).one()
+
+
+def saved_transactions(session_factory):
+    with session_factory() as session:
+        return {t.transaction_id: t for t in session.scalars(select(Transaction))}
+
+
+def saved_row_errors(session_factory, batch):
+    with session_factory() as session:
+        errors = session.scalars(
+            select(ImportRowError)
+            .where(ImportRowError.batch_id == batch.id)
+            .order_by(ImportRowError.row_number)
+        )
+        return [
+            (e.row_number, e.column_name, e.message, e.transaction_id) for e in errors
+        ]
+
+
+def saved_products(session_factory):
+    with session_factory() as session:
+        products = {p.sku: p.name for p in session.scalars(select(Product))}
+        aliases = sorted(
+            (a.sku, a.alias_name) for a in session.scalars(select(ProductAlias))
+        )
+        return products, aliases
+
+
+def naive_utc(value):
+    # SQLite drops tzinfo on read; the stored value is UTC.
+    return value.replace(tzinfo=None)
+
+
+def test_valid_sale_is_saved_with_converted_values(tmp_path, session_factory):
+    row = row_with(unit_price="99.99", discount="12.50")
+
+    assert import_csv(tmp_path, [row]) == 0
+
+    saved = saved_transactions(session_factory)["T1"]
+    batch = only_batch(session_factory)
+    assert naive_utc(saved.sold_at) == datetime(2026, 10, 17, 3, 30)  # 09:00 IST
+    assert (saved.quantity, saved.unit_price_paise, saved.discount_paise) == (
+        2,
+        9999,
+        1250,
+    )
+    assert saved.line_total_paise == 2 * 9999 - 1250
+    assert saved.is_return is False
+    assert (saved.store_code, saved.sku, saved.product_name) == (
+        "ST01",
+        "SKU1",
+        "Masala Chai",
+    )
+    assert (saved.payment_mode, saved.original_transaction_id) == ("UPI", None)
+    assert saved.batch_id == batch.id
+
+
+def test_batch_counts_and_status_after_import(tmp_path, session_factory):
+    rows = [
+        row_with(transaction_id="T1"),
+        row_with(transaction_id="T2", payment_mode="CHEQUE"),
+        ROW[:9],
+        row_with(transaction_id="T4"),
+    ]
+
+    assert import_csv(tmp_path, rows) == 0
+
+    batch = only_batch(session_factory)
+    assert batch.status == "COMPLETED"
+    assert (batch.rows_total, batch.rows_accepted, batch.rows_rejected) == (4, 2, 2)
+    assert batch.attempt_count == 1
+    assert naive_utc(batch.started_at) == naive_utc(FIXED_NOW)
+    assert naive_utc(batch.completed_at) == naive_utc(FIXED_NOW)
+    assert batch.failure_reason is None
+    assert sorted(saved_transactions(session_factory)) == ["T1", "T4"]
+
+
+def test_rejected_rows_are_saved_in_import_row_errors(tmp_path, session_factory):
+    rows = [
+        ROW,
+        row_with(transaction_id="T2", sku=""),
+        ROW[:9],
+        row_with(transaction_id="T4", quantity="0"),
+    ]
+
+    import_csv(tmp_path, rows)
+
+    assert saved_row_errors(session_factory, only_batch(session_factory)) == [
+        (3, "sku", "Missing required value(s): sku.", "T2"),
+        (4, "__row__", "Row has 9 column(s); expected 10.", None),
+        (5, "quantity", "quantity must not be zero.", "T4"),
+    ]
+
+
+def test_all_rows_rejected_still_completes_batch(tmp_path, session_factory):
+    import_csv(tmp_path, [row_with(store_code="NOPE")])
+
+    batch = only_batch(session_factory)
+    assert batch.status == "COMPLETED"
+    assert (batch.rows_total, batch.rows_accepted, batch.rows_rejected) == (1, 0, 1)
+    assert saved_transactions(session_factory) == {}
+
+
+# Duplicate transaction IDs
+
+
+def test_duplicate_id_in_file_keeps_first_and_rejects_later(tmp_path, session_factory):
+    rows = [
+        row_with(transaction_id="T1", quantity="2"),
+        row_with(transaction_id="T1", quantity="7"),
+        row_with(transaction_id="T1", quantity="9"),
+    ]
+
+    import_csv(tmp_path, rows)
+
+    saved = saved_transactions(session_factory)
+    assert list(saved) == ["T1"]
+    assert saved["T1"].quantity == 2
+    duplicate_message = "Transaction ID 'T1' already appears in row 2."
+    assert saved_row_errors(session_factory, only_batch(session_factory)) == [
+        (3, "transaction_id", duplicate_message, "T1"),
+        (4, "transaction_id", duplicate_message, "T1"),
+    ]
+
+
+def test_later_copy_is_accepted_when_first_copy_was_rejected(tmp_path, session_factory):
+    rows = [
+        row_with(transaction_id="T1", unit_price="abc"),
+        row_with(transaction_id="T1", unit_price="100.00"),
+    ]
+
+    import_csv(tmp_path, rows)
+
+    assert saved_transactions(session_factory)["T1"].unit_price_paise == 10000
+    errors = saved_row_errors(session_factory, only_batch(session_factory))
+    assert [(row, column) for row, column, _, _ in errors] == [(2, "unit_price")]
+
+
+def test_id_already_in_database_is_rejected(tmp_path, session_factory):
+    import_csv(tmp_path, [row_with(transaction_id="T1")], name="day1.csv")
+
+    import_csv(
+        tmp_path,
+        [row_with(transaction_id="T1", quantity="5"), row_with(transaction_id="T2")],
+        name="day2.csv",
+    )
+
+    day2 = batch_named(session_factory, "day2.csv")
+    saved = saved_transactions(session_factory)
+    assert saved["T1"].quantity == 2  # The original from day1 is untouched.
+    assert saved["T1"].batch_id == batch_named(session_factory, "day1.csv").id
+    assert saved["T2"].batch_id == day2.id
+    assert saved_row_errors(session_factory, day2) == [
+        (2, "transaction_id", "Transaction ID 'T1' has already been imported.", "T1")
+    ]
+    assert (day2.rows_accepted, day2.rows_rejected) == (1, 1)
+
+
+# Sales rules applied during import
+
+
+@pytest.mark.parametrize(
+    ("changes", "column", "message"),
+    [
+        (
+            {"sold_at": "2026-10-17T09:00:00"},
+            "sold_at",
+            "sold_at must be YYYY-MM-DD HH:MM:SS (IST); got '2026-10-17T09:00:00'.",
+        ),
+        ({"sold_at": "2026-10-17 17:30:01"}, "sold_at", "sold_at is in the future."),
+        (
+            {"quantity": "1.5"},
+            "quantity",
+            "quantity must be a whole number; got '1.5'.",
+        ),
+        ({"unit_price": "-1"}, "unit_price", "unit_price must not be negative."),
+        (
+            {"discount": "200.01"},
+            "discount",
+            "discount (₹200.01) exceeds the line amount (₹200.00).",
+        ),
+        (
+            {"payment_mode": "upi"},
+            "payment_mode",
+            "payment_mode must be CASH, UPI or CARD; got 'upi'.",
+        ),
+        ({"store_code": "ST99"}, "store_code", "Store code 'ST99' does not exist."),
+        (
+            {"original_transaction_id": "T0"},
+            "original_transaction_id",
+            "Only returns (negative quantity) may set original_transaction_id.",
+        ),
+    ],
+    ids=[
+        "bad-timestamp-format",
+        "future-timestamp",
+        "non-integer-quantity",
+        "negative-price",
+        "discount-over-amount",
+        "lowercase-payment-mode",
+        "unknown-store",
+        "sale-with-original",
+    ],
+)
+def test_rule_violations_are_rejected_with_column_and_message(
+    tmp_path, session_factory, changes, column, message
+):
+    import_csv(tmp_path, [row_with(**changes)])
+
+    assert saved_transactions(session_factory) == {}
+    assert saved_row_errors(session_factory, only_batch(session_factory)) == [
+        (2, column, message, "T1")
+    ]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"sold_at": "2026-10-17 17:30:00"},  # exactly now in IST
+        {"discount": "200.00"},  # exactly the line amount
+        {"discount": "0"},
+        {"unit_price": "0"},
+    ],
+    ids=["sold-at-now", "max-discount", "zero-discount", "free-item"],
+)
+def test_boundary_values_are_accepted(tmp_path, session_factory, changes):
+    import_csv(tmp_path, [row_with(**changes)])
+
+    assert list(saved_transactions(session_factory)) == ["T1"]
+
+
+def test_return_of_sale_in_same_file_is_saved(tmp_path, session_factory):
+    rows = [
+        row_with(transaction_id="T1", quantity="5"),
+        row_with(transaction_id="R1", quantity="-2", original_transaction_id="T1"),
+    ]
+
+    import_csv(tmp_path, rows)
+
+    saved = saved_transactions(session_factory)["R1"]
+    assert saved.is_return is True
+    assert saved.original_transaction_id == "T1"
+    assert saved.line_total_paise == -2 * 10000
+
+
+OVER_RETURN_MESSAGE = (
+    "Returning 1 would bring total returns to 6, more than the 5 originally sold."
+)
+
+
+def test_cumulative_returns_across_files_cannot_exceed_sale(tmp_path, session_factory):
+    import_csv(
+        tmp_path,
+        [
+            row_with(transaction_id="T1", quantity="5"),
+            row_with(transaction_id="R1", quantity="-3", original_transaction_id="T1"),
+        ],
+        name="day1.csv",
+    )
+
+    import_csv(
+        tmp_path,
+        [
+            row_with(transaction_id="R2", quantity="-2", original_transaction_id="T1"),
+            row_with(transaction_id="R3", quantity="-1", original_transaction_id="T1"),
+        ],
+        name="day2.csv",
+    )
+
+    assert "R2" in saved_transactions(session_factory)  # 3 + 2 = 5, exactly the sale
+    assert saved_row_errors(
+        session_factory, batch_named(session_factory, "day2.csv")
+    ) == [
+        (
+            3,
+            "quantity",
+            OVER_RETURN_MESSAGE,
+            "R3",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("return_changes", "column", "message"),
+    [
+        (
+            {"original_transaction_id": "T404"},
+            "original_transaction_id",
+            "Original transaction 'T404' not found.",
+        ),
+        (
+            {"original_transaction_id": ""},
+            "original_transaction_id",
+            "A return (negative quantity) must set original_transaction_id.",
+        ),
+        (
+            {"store_code": "ST02"},
+            "store_code",
+            "Return store 'ST02' does not match the original sale's store 'ST01'.",
+        ),
+        (
+            {"sku": "SKU2"},
+            "sku",
+            "Return SKU 'SKU2' does not match the original sale's SKU 'SKU1'.",
+        ),
+    ],
+    ids=["unknown-original", "no-original", "different-store", "different-sku"],
+)
+def test_invalid_returns_are_rejected(
+    tmp_path, session_factory, return_changes, column, message
+):
+    return_row = row_with(
+        transaction_id="R1", quantity="-1", original_transaction_id="T1"
+    )
+    return_row = [
+        return_changes.get(name, value)
+        for name, value in zip(HEADER, return_row, strict=True)
+    ]
+
+    import_csv(tmp_path, [row_with(transaction_id="T1"), return_row])
+
+    assert "R1" not in saved_transactions(session_factory)
+    assert saved_row_errors(session_factory, only_batch(session_factory)) == [
+        (3, column, message, "R1")
+    ]
+
+
+def test_return_listed_before_its_sale_is_not_found(tmp_path, session_factory):
+    rows = [
+        row_with(transaction_id="R1", quantity="-1", original_transaction_id="T1"),
+        row_with(transaction_id="T1"),
+    ]
+
+    import_csv(tmp_path, rows)
+
+    assert list(saved_transactions(session_factory)) == ["T1"]
+    errors = saved_row_errors(session_factory, only_batch(session_factory))
+    assert errors[0][:2] == (2, "original_transaction_id")
+
+
+# Products and aliases
+
+
+def test_new_sku_creates_product_and_new_names_become_aliases(
+    tmp_path, session_factory
+):
+    rows = [
+        row_with(transaction_id="T1", product_name="Masala Chai"),
+        row_with(transaction_id="T2", product_name="Chai Masala"),
+        row_with(transaction_id="T3", product_name="Chai Masala"),
+        row_with(transaction_id="T4", product_name="Masala Chai"),
+    ]
+
+    import_csv(tmp_path, rows)
+
+    products, aliases = saved_products(session_factory)
+    assert products == {"SKU1": "Masala Chai"}
+    assert aliases == [("SKU1", "Chai Masala")]
+    assert saved_transactions(session_factory)["T2"].product_name == "Chai Masala"
+
+
+def test_existing_product_gets_alias_from_a_later_file(tmp_path, session_factory):
+    import_csv(tmp_path, [row_with(transaction_id="T1")], name="day1.csv")
+    import_csv(
+        tmp_path,
+        [row_with(transaction_id="T2", product_name="Tea (Masala)")],
+        name="day2.csv",
+    )
+
+    assert saved_products(session_factory) == (
+        {"SKU1": "Masala Chai"},
+        [("SKU1", "Tea (Masala)")],
+    )
+
+
+def test_rejected_row_does_not_create_product(tmp_path, session_factory):
+    import_csv(tmp_path, [row_with(sku="SKU9", store_code="NOPE")])
+
+    assert saved_products(session_factory) == ({}, [])
+
+
+# Failure and retry
+
+
+def test_database_failure_saves_nothing_and_marks_batch_failed(
+    tmp_path, capsys, session_factory, monkeypatch
+):
+    def broken_lookup(*args, **kwargs):
+        raise OperationalError("SELECT", {}, Exception("connection lost"))
+
+    monkeypatch.setattr(csv_validator, "load_import_state", broken_lookup)
+
+    exit_code = import_csv(tmp_path, [ROW, row_with(transaction_id="T2", sku="")])
+
+    batch = only_batch(session_factory)
+    assert exit_code == 1
+    assert batch.status == "FAILED"
+    assert batch.failure_reason == (
+        "Database error while saving rows; nothing was saved. "
+        "Upload the same file again to retry."
+    )
+    assert batch.attempt_count == 1
+    assert saved_transactions(session_factory) == {}
+    assert saved_row_errors(session_factory, batch) == []
+    assert f"Batch {batch.id} FAILED:" in capsys.readouterr().err
+
+
+def test_uploading_a_failed_file_again_retries_it(
+    tmp_path, session_factory, monkeypatch
+):
+    real_lookup = csv_validator.load_import_state
+
+    def broken_lookup(*args, **kwargs):
+        raise OperationalError("SELECT", {}, Exception("connection lost"))
+
+    monkeypatch.setattr(csv_validator, "load_import_state", broken_lookup)
+    import_csv(tmp_path, [ROW])
+    monkeypatch.setattr(csv_validator, "load_import_state", real_lookup)
+
+    exit_code = import_csv(tmp_path, [ROW])
+
+    batch = only_batch(session_factory)
+    assert exit_code == 0
+    assert batch.status == "COMPLETED"
+    assert batch.attempt_count == 2
+    assert batch.failure_reason is None
+    assert list(saved_transactions(session_factory)) == ["T1"]
+
+
+def test_batch_already_processing_is_not_imported_again(
+    tmp_path, capsys, session_factory
+):
+    path = write_file(tmp_path, "sales.csv")
+    with session_factory() as session:
+        session.add(
+            ImportBatch(
+                filename="sales.csv",
+                file_sha256=hashlib.sha256(VALID_CONTENT).hexdigest(),
+                status="PROCESSING",
+            )
+        )
+        session.commit()
+
+    exit_code = main([str(path)])
+
+    assert exit_code == 1
+    assert "status PROCESSING" in capsys.readouterr().err
+    assert saved_transactions(session_factory) == {}
+
+
+def test_queued_batch_that_never_ran_is_processed_on_upload(tmp_path, session_factory):
+    path = write_file(tmp_path, "sales.csv")
+    with session_factory() as session:
+        session.add(
+            ImportBatch(
+                filename="sales.csv",
+                file_sha256=hashlib.sha256(VALID_CONTENT).hexdigest(),
+                status="QUEUED",
+            )
+        )
+        session.commit()
+
+    assert main([str(path)]) == 0
+
+    batch = only_batch(session_factory)
+    assert (batch.status, batch.attempt_count) == ("COMPLETED", 1)
+    assert list(saved_transactions(session_factory)) == ["T1"]
