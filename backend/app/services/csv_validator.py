@@ -388,7 +388,7 @@ def import_rows(
     state = load_import_state(session, result.rows)
     errors = list(result.row_errors)
     accepted = 0
-    for row in sorted(result.rows, key=chronological_order):
+    for row in processing_order(result.rows):
         try:
             sale = accept_row(row.values, state, clock)
         except SaleRuleViolation as violation:
@@ -418,20 +418,38 @@ def import_rows(
     return accepted, errors
 
 
-def chronological_order(row: CsvRow) -> tuple[bool, datetime, bool, int]:
-    """Sort key: oldest sold_at first, sales before returns at the same time.
+def processing_order(rows: Sequence[CsvRow]) -> list[CsvRow]:
+    """Order rows in two passes: every sale first, then every return.
 
-    Rows are processed in this order so a return listed above its sale in the
-    file still finds the sale. Rows whose sold_at or quantity cannot be parsed
-    will be rejected anyway; they go last, in file order. row_number breaks
-    ties and is never changed, so errors still name the original CSV row.
+    Pass 1 holds all rows that are not returns (including rows that will be
+    rejected anyway), so by Pass 2 every sale in the file has been accepted or
+    rejected and any return can find its original wherever it was listed.
+    Each pass runs oldest sold_at first, so cumulative return totals and
+    duplicate IDs are resolved in time order. Rows are only reordered, never
+    changed: row_number stays the original CSV row for error reports.
     """
+    sales_pass, returns_pass = [], []
+    for row in rows:
+        (returns_pass if is_return_row(row) else sales_pass).append(row)
+    return sorted(sales_pass, key=chronological_key) + sorted(
+        returns_pass, key=chronological_key
+    )
+
+
+def is_return_row(row: CsvRow) -> bool:
     try:
-        sold_at = parse_sold_at(row.values["sold_at"])
-        is_return = parse_quantity(row.values["quantity"]) < 0
+        return parse_quantity(row.values["quantity"]) < 0
     except SaleRuleViolation:
-        return (True, datetime.max.replace(tzinfo=UTC), False, row.row_number)
-    return (False, sold_at, is_return, row.row_number)
+        return False  # Rejected later with a clear quantity error.
+
+
+def chronological_key(row: CsvRow) -> tuple[bool, datetime, int]:
+    # Rows with an unreadable sold_at are rejected anyway; they go last in
+    # their pass, in file order. row_number breaks ties.
+    try:
+        return (False, parse_sold_at(row.values["sold_at"]), row.row_number)
+    except SaleRuleViolation:
+        return (True, datetime.max.replace(tzinfo=UTC), row.row_number)
 
 
 def accept_row(

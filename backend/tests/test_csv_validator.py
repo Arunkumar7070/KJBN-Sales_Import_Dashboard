@@ -24,6 +24,7 @@ from app.services.csv_validator import (
     RowError,
     check_csv_file,
     main,
+    processing_order,
     register_import_batch,
 )
 
@@ -1226,10 +1227,14 @@ def test_errors_keep_original_csv_row_numbers_after_sorting(tmp_path, session_fa
     assert sorted(saved_transactions(session_factory)) == ["R1", "T1"]
 
 
-def test_return_timed_before_its_sale_is_still_rejected(tmp_path, session_factory):
+def test_return_timed_before_its_sale_in_same_file_is_rejected_as_before_sale(
+    tmp_path, session_factory
+):
+    # Pass 1 saves the sale first, so the return finds it and gets the precise
+    # error instead of "not found".
     rows = [
-        row_with(transaction_id="T1", sold_at="2026-10-17 09:00:00"),
         a_return("R1", "2026-10-17 08:59:59"),
+        row_with(transaction_id="T1", sold_at="2026-10-17 09:00:00"),
     ]
 
     import_csv(tmp_path, rows)
@@ -1237,12 +1242,78 @@ def test_return_timed_before_its_sale_is_still_rejected(tmp_path, session_factor
     assert list(saved_transactions(session_factory)) == ["T1"]
     assert saved_row_errors(session_factory, only_batch(session_factory)) == [
         (
-            3,
-            "original_transaction_id",
-            "Original transaction 'T1' not found.",
+            2,
+            "sold_at",
+            before_sale_message("2026-10-17 08:59:59", "2026-10-17 09:00:00"),
             "R1",
         )
     ]
+
+
+def test_returns_listed_above_their_sales_are_accepted_in_second_pass(
+    tmp_path, session_factory
+):
+    rows = [
+        a_return("R1", "2026-10-17 11:00:00", original="T1"),  # row 2
+        a_return("R2", "2026-10-17 11:30:00", quantity="-2", original="T2"),  # row 3
+        a_return("R3", "2026-10-17 12:00:00", quantity="-9", original="T2"),  # row 4
+        row_with(transaction_id="T1", sold_at="2026-10-17 09:00:00"),  # row 5
+        row_with(transaction_id="T2", sold_at="2026-10-17 10:00:00", quantity="3"),
+    ]
+
+    import_csv(tmp_path, rows)
+
+    saved = saved_transactions(session_factory)
+    batch = only_batch(session_factory)
+    assert sorted(saved) == ["R1", "R2", "T1", "T2"]
+    assert (
+        saved["R1"].original_transaction_id,
+        saved["R2"].original_transaction_id,
+    ) == (
+        "T1",
+        "T2",
+    )
+    assert (batch.rows_total, batch.rows_accepted, batch.rows_rejected) == (5, 4, 1)
+    # R3 would bring returns on T2 to 11 of 3; the error names its CSV row.
+    assert saved_row_errors(session_factory, batch) == [
+        (
+            4,
+            "quantity",
+            (
+                "Returning 9 would bring total returns to 11, "
+                "more than the 3 originally sold."
+            ),
+            "R3",
+        )
+    ]
+
+
+def test_processing_order_runs_sales_then_returns_and_keeps_row_numbers():
+    def csv_row(row_number, transaction_id, sold_at, quantity):
+        values = dict(EXPECTED_ROW)
+        values.update(transaction_id=transaction_id, sold_at=sold_at, quantity=quantity)
+        return CsvRow(row_number, values)
+
+    rows = [
+        csv_row(2, "R1", "2026-10-17 11:00:00", "-1"),
+        csv_row(3, "T2", "2026-10-17 10:00:00", "1"),
+        csv_row(4, "BAD", "not a date", "1"),
+        csv_row(5, "T1", "2026-10-17 09:00:00", "1"),
+        csv_row(6, "R0", "2026-10-17 10:30:00", "-1"),
+        csv_row(7, "Q", "2026-10-17 08:00:00", "lots"),
+    ]
+
+    ordered = processing_order(rows)
+
+    assert [(row.row_number, row.values["transaction_id"]) for row in ordered] == [
+        (7, "Q"),  # Pass 1: sales (and unreadable quantities), oldest first
+        (5, "T1"),
+        (3, "T2"),
+        (4, "BAD"),  # unreadable sold_at goes last in its pass
+        (6, "R0"),  # Pass 2: returns, oldest first
+        (2, "R1"),
+    ]
+    assert sorted(ordered, key=lambda row: row.row_number) == rows  # Rows unchanged.
 
 
 def test_chronologically_first_duplicate_is_kept(tmp_path, session_factory):
