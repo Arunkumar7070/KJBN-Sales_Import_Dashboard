@@ -17,6 +17,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app import clock
 from app.database import Base, get_db
 from app.main import app
 from app.models import ImportBatch, Product, Store, Transaction
@@ -29,6 +30,13 @@ SAMPLE = [
     ("T4", "ST02", "SKU3", "2026-10-17 01:00:00", 10, 1500, "UPI", None),
     ("R1", "ST01", "SKU1", "2026-10-17 12:00:00", -1, 10000, "UPI", "T1"),
 ]
+NOW = datetime(2026, 10, 18, 23, 0, tzinfo=IST)  # The clock's "now" in these tests.
+
+
+@pytest.fixture(autouse=True)
+def fixed_clock(monkeypatch):
+    """Pin "now" so results don't depend on the day the tests run."""
+    monkeypatch.setattr(clock, "system_now", lambda: NOW)
 
 
 @pytest.fixture
@@ -123,6 +131,7 @@ def test_daily_revenue_groups_by_ist_day_and_fills_gaps(client, sample):
         ("2026-10-15", 35000),  # T2 at 23:59:59 IST stays on the 15th.
         ("2026-10-16", 0),  # No sales: still listed.
         ("2026-10-17", 25000),  # T3 at 00:00 IST is the 17th; R1 subtracts.
+        ("2026-10-18", 0),  # Without date_to the list runs until today.
     ]
     assert daily[0]["revenue"]["rupees"] == "350.00"
 
@@ -253,10 +262,10 @@ def test_range_without_any_sales_returns_zeros_without_errors(client, sample):
     ]
 
 
-def test_only_date_from_runs_until_the_last_sale(client, sample):
+def test_only_date_from_runs_until_today(client, sample):
     daily = dashboard(client, date_from="2026-10-16")["daily_revenue"]
 
-    assert [d["day"] for d in daily] == ["2026-10-16", "2026-10-17"]
+    assert [d["day"] for d in daily] == ["2026-10-16", "2026-10-17", "2026-10-18"]
 
 
 def test_product_with_only_returns_is_not_a_top_product(

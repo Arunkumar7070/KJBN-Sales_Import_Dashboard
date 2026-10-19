@@ -3,6 +3,9 @@
 Definitions:
 - Revenue is net: the sum of line_total, so returns subtract.
 - Days are IST calendar days; date ranges include both ends.
+- Everything is "as of" app.clock.utc_now(): transactions sold after it are
+  left out, and a missing date_to means the clock's IST date. With the
+  X-Test-Clock header this shows the data as it was at that time.
 - Percentages divide with NULLIF(denominator, 0), so an empty range gives
   NULL instead of a division-by-zero error, reported as 0.
 - The payment split covers sales only (how customers paid for purchases), so
@@ -17,6 +20,7 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.expression import ColumnElement, FunctionElement
 
+from app.clock import utc_now
 from app.models import Product, Store, Transaction
 from app.schemas import (
     DailyRevenue,
@@ -58,11 +62,16 @@ def start_of_ist_day(day: date) -> datetime:
     return datetime.combine(day, clock_time.min, tzinfo=IST).astimezone(UTC)
 
 
+def ist_today() -> date:
+    return utc_now().astimezone(IST).date()
+
+
 def sold_within_ist_days(
     date_from: date | None, date_to: date | None
 ) -> list[ColumnElement[bool]]:
-    """Conditions keeping transactions sold on date_from..date_to (IST, inclusive)."""
-    conditions = []
+    """Conditions keeping transactions sold on date_from..date_to (IST, inclusive)
+    and not after the clock's current time."""
+    conditions = [Transaction.sold_at <= utc_now()]
     if date_from is not None:
         conditions.append(Transaction.sold_at >= start_of_ist_day(date_from))
     if date_to is not None:
@@ -110,10 +119,11 @@ def daily_revenue(
     revenue_by_day = {date.fromisoformat(str(d)): int(paise) for d, paise in rows}
 
     # Every day in the range gets an entry (0 when nothing sold) so charts have
-    # no gaps. Without bounds, the range is the first to the last day with sales.
+    # no gaps. Without date_from it starts at the first sale; without date_to it
+    # ends today (by the clock).
     first = date_from or min(revenue_by_day, default=None)
-    last = date_to or max(revenue_by_day, default=None)
-    if first is None or last is None:
+    last = date_to or ist_today()
+    if first is None or first > last:
         return []
     return [
         DailyRevenue(day=day, revenue=Money(paise=revenue_by_day.get(day, 0)))

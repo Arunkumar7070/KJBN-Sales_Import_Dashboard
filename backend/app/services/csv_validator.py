@@ -37,7 +37,7 @@ import sys
 import time
 import uuid
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -46,6 +46,7 @@ from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app import clock
 from app.config import get_settings
 from app.database import SessionLocal
 from app.models import (
@@ -398,7 +399,7 @@ def print_summary(outcomes: list[FileOutcome]) -> None:
 
 
 def utc_now() -> datetime:
-    return datetime.now(UTC)
+    return clock.utc_now()
 
 
 @dataclass(frozen=True)
@@ -962,17 +963,21 @@ def enqueue_upload(
 
 
 def run_worker(
-    *, drain: bool, poll_interval_seconds: float = WORKER_POLL_INTERVAL_SECONDS
+    *,
+    drain: bool,
+    poll_interval_seconds: float = WORKER_POLL_INTERVAL_SECONDS,
+    batch_ids: Collection[uuid.UUID] | None = None,
 ) -> list[FileOutcome]:
     """Import staged batches one at a time, oldest first.
 
     With drain=True, stop when nothing is left (or the database is down);
-    otherwise keep polling until interrupted (Ctrl+C).
+    otherwise keep polling until interrupted (Ctrl+C). With batch_ids, only
+    those batches are imported.
     """
     outcomes = []
     while True:
         try:
-            outcome = run_next_batch()
+            outcome = run_next_batch(batch_ids)
         except SQLAlchemyError:
             logger.exception("Worker could not reach the database")
             print("ERROR worker: database unavailable.", file=sys.stderr)
@@ -990,22 +995,27 @@ def run_worker(
             time.sleep(poll_interval_seconds)
 
 
-def run_next_batch() -> FileOutcome | None:
+def run_next_batch(
+    batch_ids: Collection[uuid.UUID] | None = None,
+) -> FileOutcome | None:
     """Claim the oldest batch with a staged payload and import it; None if idle."""
     with SessionLocal() as session:
-        batch = claim_next_batch(session)
+        batch = claim_next_batch(session, batch_ids)
         if batch is None:
             return None
         return import_staged_batch(session, batch)
 
 
-def claim_next_batch(session: Session) -> ImportBatch | None:
+def claim_next_batch(
+    session: Session, batch_ids: Collection[uuid.UUID] | None = None
+) -> ImportBatch | None:
     # Only batches with a payload have work left. Several candidates are tried
     # because another worker may claim the first one between SELECT and UPDATE.
+    only_these = [ImportBatch.id.in_(batch_ids)] if batch_ids is not None else []
     candidates = session.scalars(
         select(ImportBatch)
         .join(ImportPayload, ImportPayload.batch_id == ImportBatch.id)
-        .where(is_claimable())
+        .where(is_claimable(), *only_these)
         .order_by(ImportBatch.uploaded_at, ImportBatch.id)
         .limit(10)
     ).all()

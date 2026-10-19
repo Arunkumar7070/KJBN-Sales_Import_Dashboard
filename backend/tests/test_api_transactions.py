@@ -6,10 +6,19 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app import clock
 from app.database import Base, get_db
 from app.main import app
 from app.models import ImportBatch, Product, Store, Transaction
 from app.services.sales_rules import IST
+
+NOW = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)  # After every sample sale.
+
+
+@pytest.fixture(autouse=True)
+def fixed_clock(monkeypatch):
+    """Pin "now" so results don't depend on the day the tests run."""
+    monkeypatch.setattr(clock, "system_now", lambda: NOW)
 
 
 def ist(text):

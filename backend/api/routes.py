@@ -9,7 +9,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterator
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -29,6 +29,7 @@ from sqlalchemy import ColumnElement, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
+from app import clock
 from app.config import get_settings
 from app.database import SessionLocal, get_db
 from app.models import ImportBatch, ImportRowError, Store, Transaction
@@ -162,9 +163,11 @@ def upload_imports(
 
     response = ImportUploadResponse(files=results)
     if response.queued_batch_ids:
-        # Runs after the response is sent. Draining imports every staged batch;
-        # several drains at once are safe because each batch is claimed atomically.
-        background_tasks.add_task(run_worker, drain=True)
+        # Runs after the response is sent, when this request's clock is gone,
+        # so the frozen test time (if any) is handed over explicitly.
+        background_tasks.add_task(
+            import_in_background, response.queued_batch_ids, clock.frozen_now()
+        )
         return response
     no_file_usable = any(result.status == INVALID for result in results)
     return JSONResponse(
@@ -173,6 +176,19 @@ def upload_imports(
         else status.HTTP_200_OK,
         content=response.model_dump(mode="json"),
     )
+
+
+def import_in_background(
+    batch_ids: list[uuid.UUID], frozen_now: datetime | None
+) -> None:
+    """Import staged files after the response has been sent.
+
+    With a test clock, only this request's batches are imported, under that
+    clock. Otherwise every staged batch is drained; several drains at once are
+    safe because each batch is claimed atomically.
+    """
+    with clock.frozen_at(frozen_now):
+        run_worker(drain=True, batch_ids=batch_ids if frozen_now else None)
 
 
 def stage_upload(
