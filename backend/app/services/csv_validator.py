@@ -35,6 +35,7 @@ import io
 import logging
 import sys
 import time
+import uuid
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
@@ -316,6 +317,7 @@ class FileOutcome:
     path: Path
     status: str  # One of SUMMARY_ORDER.
     detail: str
+    batch_id: uuid.UUID | None = None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -935,6 +937,7 @@ def enqueue_upload(
             ALREADY_UPLOADED,
             f"this file was already uploaded as '{batch.filename}' "
             f"(batch {batch.id}, status {batch.status}).",
+            batch_id=batch.id,
         )
 
     session.add(
@@ -949,10 +952,13 @@ def enqueue_upload(
     except IntegrityError:  # Another upload of the same file staged it first.
         session.rollback()
         return FileOutcome(
-            path, ALREADY_UPLOADED, f"this file is already queued (batch {batch.id})."
+            path,
+            ALREADY_UPLOADED,
+            f"this file is already queued (batch {batch.id}).",
+            batch_id=batch.id,
         )
     action = "queued again for retry" if retry else "queued"
-    return FileOutcome(path, QUEUED, f"batch {batch.id} {action}.")
+    return FileOutcome(path, QUEUED, f"batch {batch.id} {action}.", batch_id=batch.id)
 
 
 def run_worker(

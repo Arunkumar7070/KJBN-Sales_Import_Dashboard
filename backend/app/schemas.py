@@ -205,3 +205,39 @@ class DashboardResponse(BaseModel):
         description="One entry per store."
     )
     payment_split: list[PaymentSplit] = Field(description="One entry per payment mode.")
+
+
+# Uploads
+
+UploadStatus = Literal["QUEUED", "ALREADY UPLOADED", "INVALID"]
+
+
+class UploadedFileResult(BaseModel):
+    """What happened to one file in an upload request."""
+
+    filename: str = Field(examples=["sales_2026-10-17.csv"])
+    status: UploadStatus = Field(
+        description=(
+            "QUEUED: staged; the worker will import it. ALREADY UPLOADED: the same "
+            "file (same bytes) was uploaded before. INVALID: not accepted (see message)."
+        )
+    )
+    batch_id: uuid.UUID | None = Field(
+        description="Batch to poll for the import result; null when INVALID."
+    )
+    message: str = Field(
+        examples=["batch 3f2c9a7e-0b1d-4c55-9a0e-2d1f6b7c8e90 queued."]
+    )
+
+
+class ImportUploadResponse(BaseModel):
+    """Result of an upload request, one entry per file in the order sent."""
+
+    files: list[UploadedFileResult]
+
+    @computed_field(
+        description="IDs of the batches created or re-queued by this request."
+    )
+    @property
+    def queued_batch_ids(self) -> list[uuid.UUID]:
+        return [f.batch_id for f in self.files if f.status == "QUEUED" and f.batch_id]

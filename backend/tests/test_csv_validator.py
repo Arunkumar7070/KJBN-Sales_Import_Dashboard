@@ -4,9 +4,8 @@ import os
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import BigInteger, create_engine, select
+from sqlalchemy import create_engine, select
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from app.config import Settings
@@ -64,13 +63,6 @@ ROW = [
 EXPECTED_ROW = dict(zip(HEADER, ROW, strict=True))
 # 17:30 IST on the same day as ROW's sale, so every test row is in the past.
 FIXED_NOW = datetime(2026, 10, 17, 12, 0, tzinfo=UTC)
-
-
-@compiles(BigInteger, "sqlite")
-def bigint_as_sqlite_integer(type_, compiler, **kwargs):
-    # Only "INTEGER PRIMARY KEY" auto-increments in SQLite (PostgreSQL uses
-    # BIGSERIAL). SQLite INTEGER is 64-bit, so money values are unaffected.
-    return "INTEGER"
 
 
 @pytest.fixture(autouse=True)
