@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app import clock
 from app.config import get_settings
 from app.database import SessionLocal, get_db
+from app.logging_config import current_request_id, request_context
 from app.models import ImportBatch, ImportRowError, Store, Transaction
 from app.schemas import (
     BatchListResponse,
@@ -163,10 +164,13 @@ def upload_imports(
 
     response = ImportUploadResponse(files=results)
     if response.queued_batch_ids:
-        # Runs after the response is sent, when this request's clock is gone,
-        # so the frozen test time (if any) is handed over explicitly.
+        # Runs after the response is sent, when this request's context is gone,
+        # so the frozen test time (if any) and the request ID are handed over.
         background_tasks.add_task(
-            import_in_background, response.queued_batch_ids, clock.frozen_now()
+            import_in_background,
+            response.queued_batch_ids,
+            clock.frozen_now(),
+            current_request_id(),
         )
         return response
     no_file_usable = any(result.status == INVALID for result in results)
@@ -179,15 +183,16 @@ def upload_imports(
 
 
 def import_in_background(
-    batch_ids: list[uuid.UUID], frozen_now: datetime | None
+    batch_ids: list[uuid.UUID], frozen_now: datetime | None, request_id: str | None
 ) -> None:
     """Import staged files after the response has been sent.
 
     With a test clock, only this request's batches are imported, under that
     clock. Otherwise every staged batch is drained; several drains at once are
-    safe because each batch is claimed atomically.
+    safe because each batch is claimed atomically. Logs carry the request ID of
+    the upload that started the import.
     """
-    with clock.frozen_at(frozen_now):
+    with request_context(request_id), clock.frozen_at(frozen_now):
         run_worker(drain=True, batch_ids=batch_ids if frozen_now else None)
 
 
