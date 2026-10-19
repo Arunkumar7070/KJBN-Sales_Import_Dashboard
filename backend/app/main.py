@@ -5,8 +5,8 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from api.routes import analytics_router, transactions_router
 from api.routes import router as imports_router
-from api.routes import transactions_router
 from app.database import check_database_connection, get_db
 
 logger = logging.getLogger(__name__)
@@ -18,6 +18,7 @@ app = FastAPI(
 )
 app.include_router(imports_router)
 app.include_router(transactions_router)
+app.include_router(analytics_router)
 
 
 @app.get("/health", tags=["Health"])

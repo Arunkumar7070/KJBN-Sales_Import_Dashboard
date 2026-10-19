@@ -192,11 +192,13 @@ class DailyRevenue(BaseModel):
     """Net revenue for one day."""
 
     day: date = Field(description="Calendar day (IST).", examples=["2026-10-17"])
-    revenue: Money = Field(description="Sum of line totals that day; returns subtract.")
+    revenue: Money = Field(
+        description="Sum of line totals that day; returns subtract. 0 on days without sales."
+    )
 
 
 class StoreRevenue(BaseModel):
-    """Net revenue for one store."""
+    """Net revenue for one store (stores without sales in the range show 0)."""
 
     store_code: str = Field(examples=["ST01"])
     store_name: str = Field(examples=["Anna Nagar"])
@@ -204,7 +206,7 @@ class StoreRevenue(BaseModel):
 
 
 class TopProduct(BaseModel):
-    """A best-selling product."""
+    """A best-selling product, ranked by net units sold."""
 
     rank: int = Field(ge=1, le=10, description="1 = best seller.", examples=[1])
     sku: str = Field(examples=["SKU1"])
@@ -212,13 +214,13 @@ class TopProduct(BaseModel):
         description="Product's canonical name.", examples=["Masala Chai"]
     )
     quantity_sold: int = Field(
-        description="Units sold, net of returns.", examples=[420]
+        gt=0, description="Units sold minus units returned.", examples=[420]
     )
     revenue: Money = Field(description="Net revenue from this product.")
 
 
 class StoreReturnRate(BaseModel):
-    """How much of a store's sold quantity came back as returns."""
+    """How much of a store's sold quantity came back as returns, within the range."""
 
     store_code: str = Field(examples=["ST01"])
     units_sold: int = Field(
@@ -233,15 +235,17 @@ class StoreReturnRate(BaseModel):
 
 
 class PaymentSplit(BaseModel):
-    """Revenue taken through one payment mode."""
+    """How customers paid for purchases: sales only, returns excluded."""
 
     payment_mode: PaymentMode
-    transaction_count: int = Field(ge=0, examples=[310])
-    revenue: Money = Field(description="Net revenue through this payment mode.")
+    transaction_count: int = Field(
+        ge=0, description="Sales paid this way.", examples=[310]
+    )
+    revenue: Money = Field(description="Sales revenue paid this way.")
     share_percent: float = Field(
         ge=0,
         le=100,
-        description="This mode's share of total revenue, rounded to 2 decimals.",
+        description="This mode's share of sales revenue, rounded to 2 decimals; 0 if no sales.",
         examples=[62.5],
     )
 
@@ -250,18 +254,20 @@ class DashboardResponse(BaseModel):
     """Everything the sales dashboard shows."""
 
     daily_revenue: list[DailyRevenue] = Field(
-        description="One entry per day, oldest first."
+        description="One entry per day in the range (or from the first to the last sale), oldest first."
     )
     store_revenue: list[StoreRevenue] = Field(
         description="One entry per store, highest revenue first."
     )
     top_products: list[TopProduct] = Field(
-        max_length=10, description="Top 10 products by revenue."
+        max_length=10, description="Up to 10 products with the most net units sold."
     )
     store_return_rates: list[StoreReturnRate] = Field(
         description="One entry per store."
     )
-    payment_split: list[PaymentSplit] = Field(description="One entry per payment mode.")
+    payment_split: list[PaymentSplit] = Field(
+        description="One entry per payment mode: CASH, UPI, CARD."
+    )
 
 
 # Uploads

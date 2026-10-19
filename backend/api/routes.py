@@ -9,8 +9,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterator
-from datetime import UTC, date, datetime, timedelta
-from datetime import time as clock_time
+from datetime import date
 from pathlib import Path
 from typing import Annotated
 
@@ -36,13 +35,14 @@ from app.models import ImportBatch, ImportRowError, Transaction
 from app.schemas import (
     BatchListResponse,
     BatchResponse,
+    DashboardResponse,
     ImportUploadResponse,
     TransactionListResponse,
     TransactionResponse,
     UploadedFileResult,
 )
+from app.services.analytics import build_dashboard, sold_within_ist_days
 from app.services.csv_validator import INVALID, enqueue_upload, run_worker
-from app.services.sales_rules import IST
 
 logger = logging.getLogger(__name__)
 
@@ -345,11 +345,7 @@ def list_transactions(
         int, Query(ge=1, le=MAX_PAGE_SIZE, description="Transactions per page.")
     ] = DEFAULT_PAGE_SIZE,
 ):
-    if date_from and date_to and date_from > date_to:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="date_from must be on or before date_to.",
-        )
+    check_date_range(date_from, date_to)
     # Built once and used by both queries, so total always matches the items.
     filters = transaction_filters(store_code, sku, date_from, date_to, returns_only)
 
@@ -383,19 +379,41 @@ def transaction_filters(
         filters.append(Transaction.store_code == store_code)
     if sku is not None:
         filters.append(Transaction.sku == sku)
-    if date_from is not None:
-        filters.append(Transaction.sold_at >= start_of_ist_day(date_from))
-    if date_to is not None:
-        # Before the next day's midnight, so every moment of date_to is included.
-        filters.append(
-            Transaction.sold_at < start_of_ist_day(date_to + timedelta(days=1))
-        )
+    filters.extend(sold_within_ist_days(date_from, date_to))
     if returns_only:
         filters.append(Transaction.is_return.is_(True))
     return filters
 
 
-def start_of_ist_day(day: date) -> datetime:
-    # sold_at is stored in UTC; midnight IST is 18:30 UTC the day before.
-    # Converted to UTC so drivers that ignore time zones (SQLite) compare correctly.
-    return datetime.combine(day, clock_time.min, tzinfo=IST).astimezone(UTC)
+def check_date_range(date_from: date | None, date_to: date | None) -> None:
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="date_from must be on or before date_to.",
+        )
+
+
+analytics_router = APIRouter(prefix="/api/v1/analytics", tags=["Analytics"])
+
+
+@analytics_router.get(
+    "/dashboard",
+    response_model=DashboardResponse,
+    summary="Dashboard analytics",
+    description=(
+        "Daily revenue, store revenue, top 10 products by net units, store return "
+        "rates and payment split. Dates are IST calendar days, both inclusive; "
+        "without dates, all transactions are used."
+    ),
+)
+def get_dashboard(
+    db: Annotated[Session, Depends(get_db)],
+    date_from: Annotated[
+        date | None, Query(description="First day to include (IST), YYYY-MM-DD.")
+    ] = None,
+    date_to: Annotated[
+        date | None, Query(description="Last day to include (IST), YYYY-MM-DD.")
+    ] = None,
+):
+    check_date_range(date_from, date_to)
+    return build_dashboard(db, date_from, date_to)
