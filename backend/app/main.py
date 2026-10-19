@@ -5,7 +5,7 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from api.routes import analytics_router, transactions_router
+from api.routes import analytics_router, stores_router, transactions_router
 from api.routes import router as imports_router
 from app.database import check_database_connection, get_db
 
@@ -19,6 +19,7 @@ app = FastAPI(
 app.include_router(imports_router)
 app.include_router(transactions_router)
 app.include_router(analytics_router)
+app.include_router(stores_router)
 
 
 @app.get("/health", tags=["Health"])

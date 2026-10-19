@@ -31,12 +31,13 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import get_settings
 from app.database import SessionLocal, get_db
-from app.models import ImportBatch, ImportRowError, Transaction
+from app.models import ImportBatch, ImportRowError, Store, Transaction
 from app.schemas import (
     BatchListResponse,
     BatchResponse,
     DashboardResponse,
     ImportUploadResponse,
+    StoreResponse,
     TransactionListResponse,
     TransactionResponse,
     UploadedFileResult,
@@ -417,3 +418,16 @@ def get_dashboard(
 ):
     check_date_range(date_from, date_to)
     return build_dashboard(db, date_from, date_to)
+
+
+stores_router = APIRouter(prefix="/api/v1", tags=["Stores"])
+
+
+@stores_router.get(
+    "/stores",
+    response_model=list[StoreResponse],
+    summary="List all stores",
+    description="Every store, ordered by code; use it to fill store filters.",
+)
+def list_stores(db: Annotated[Session, Depends(get_db)]):
+    return db.scalars(select(Store).order_by(Store.code)).all()

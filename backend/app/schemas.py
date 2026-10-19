@@ -66,6 +66,18 @@ def money_from_paise(value: object) -> object:
 PaiseAmount = Annotated[Money, BeforeValidator(money_from_paise)]
 
 
+class StoreResponse(BaseModel):
+    """A store, for filters such as the store dropdown."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    code: str = Field(
+        description="Store code used in CSVs and filters.", examples=["ST01"]
+    )
+    name: str = Field(description="Store display name.", examples=["Anna Nagar"])
+    city: str = Field(examples=["Chennai"])
+
+
 class BatchResponse(BaseModel):
     """One uploaded CSV file and the outcome of importing it."""
 

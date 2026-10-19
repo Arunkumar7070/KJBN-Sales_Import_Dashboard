@@ -6,11 +6,12 @@ import pytest
 from fastapi import FastAPI
 from pydantic import ValidationError
 
-from app.models import ImportBatch, Transaction
+from app.models import ImportBatch, Store, Transaction
 from app.schemas import (
     BatchResponse,
     DashboardResponse,
     Money,
+    StoreResponse,
     TopProduct,
     TransactionResponse,
 )
@@ -184,3 +185,13 @@ def test_timestamps_are_always_returned_in_utc(stored):
     data = TransactionResponse.model_validate(transaction).model_dump(mode="json")
 
     assert data["sold_at"] == "2026-10-17T03:30:00Z"
+
+
+def test_store_response_reads_orm_store():
+    store = Store(code="ST01", name="Anna Nagar", city="Chennai")
+
+    assert StoreResponse.model_validate(store).model_dump() == {
+        "code": "ST01",
+        "name": "Anna Nagar",
+        "city": "Chennai",
+    }
