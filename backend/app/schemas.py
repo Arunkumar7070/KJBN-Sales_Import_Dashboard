@@ -78,6 +78,34 @@ class StoreResponse(BaseModel):
     city: str = Field(examples=["Chennai"])
 
 
+class StoreImportRowError(BaseModel):
+    """A row of the stores CSV that was skipped."""
+
+    row_number: int = Field(
+        description="CSV row number (the header is row 1).", examples=[4]
+    )
+    column_name: str = Field(
+        description="Column with the problem, or __row__ for the whole row.",
+        examples=["city"],
+    )
+    message: str = Field(examples=["Missing required value(s): city."])
+
+
+class StoreImportResponse(BaseModel):
+    """Result of a stores CSV import."""
+
+    rows_total: int = Field(ge=0, description="Data rows in the file.", examples=[12])
+    inserted: int = Field(ge=0, description="New store codes added.", examples=[8])
+    updated: int = Field(
+        ge=0, description="Existing stores whose name or city changed.", examples=[2]
+    )
+    unchanged: int = Field(
+        ge=0, description="Existing stores already up to date.", examples=[1]
+    )
+    rejected: int = Field(ge=0, description="Rows skipped; see errors.", examples=[1])
+    errors: list[StoreImportRowError] = Field(description="Skipped rows, in row order.")
+
+
 class BatchResponse(BaseModel):
     """One uploaded CSV file and the outcome of importing it."""
 

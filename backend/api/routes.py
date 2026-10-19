@@ -39,13 +39,21 @@ from app.schemas import (
     BatchResponse,
     DashboardResponse,
     ImportUploadResponse,
+    StoreImportResponse,
+    StoreImportRowError,
     StoreResponse,
     TransactionListResponse,
     TransactionResponse,
     UploadedFileResult,
 )
 from app.services.analytics import build_dashboard, sold_within_ist_days
-from app.services.csv_validator import INVALID, enqueue_upload, run_worker
+from app.services.csv_validator import (
+    INVALID,
+    CsvFileError,
+    enqueue_upload,
+    run_worker,
+)
+from app.services.store_import import import_stores
 
 logger = logging.getLogger(__name__)
 
@@ -452,3 +460,56 @@ stores_router = APIRouter(prefix="/api/v1", tags=["Stores"])
 )
 def list_stores(db: Annotated[Session, Depends(get_db)]):
     return db.scalars(select(Store).order_by(Store.code)).all()
+
+
+@stores_router.post(
+    "/stores",
+    response_model=StoreImportResponse,
+    summary="Import stores from CSV (insert or update)",
+    description=(
+        "CSV columns: code, name, city (any order). A new code is inserted; an "
+        "existing code gets its name and city updated. Bad rows are skipped and "
+        "listed in errors; a bad file (header, encoding, type, size) is a 400."
+    ),
+    responses={
+        400: {"description": "The file can't be used; nothing was imported."},
+        429: {"description": "Upload rate limit reached; see the Retry-After header."},
+        503: {"description": "Database unavailable; nothing was imported."},
+    },
+    dependencies=[Depends(enforce_upload_rate_limit)],
+)
+def import_stores_csv(
+    file: Annotated[UploadFile, File(description="Stores CSV: code,name,city.")],
+    db: Annotated[Session, Depends(get_db)],
+):
+    max_size_bytes = get_settings().max_upload_size_bytes
+    # Never read more than one byte past the limit, so oversized bodies are cut off.
+    content = file.file.read(max_size_bytes + 1)
+    try:
+        summary = import_stores(
+            db, Path(file.filename or "").name or "stores.csv", content, max_size_bytes
+        )
+    except CsvFileError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)
+        ) from None
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Could not import stores")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable; no stores were imported. Please try again.",
+        ) from None
+    return StoreImportResponse(
+        rows_total=summary.rows_total,
+        inserted=summary.inserted,
+        updated=summary.updated,
+        unchanged=summary.unchanged,
+        rejected=len(summary.errors),
+        errors=[
+            StoreImportRowError(
+                row_number=e.row_number, column_name=e.column_name, message=e.message
+            )
+            for e in summary.errors
+        ],
+    )

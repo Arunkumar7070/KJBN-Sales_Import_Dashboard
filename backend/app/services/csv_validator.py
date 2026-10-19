@@ -266,7 +266,9 @@ def validate_row(
     return CsvRow(row_number, values)
 
 
-def find_header_problem(header: Sequence[str] | None) -> str | None:
+def find_header_problem(
+    header: Sequence[str] | None, required: Sequence[str] = REQUIRED_HEADERS
+) -> str | None:
     if not header:
         return "Header row is missing."
 
@@ -275,11 +277,11 @@ def find_header_problem(header: Sequence[str] | None) -> str | None:
         str(position) for position, name in enumerate(header, 1) if not name.strip()
     ]
     duplicates = sorted({name for name in names if names.count(name) > 1})
-    missing = [name for name in REQUIRED_HEADERS if name not in names]
+    missing = [name for name in required if name not in names]
     unexpected = [
-        describe_unexpected(name)
+        describe_unexpected(name, required)
         for name in dict.fromkeys(names)
-        if name not in REQUIRED_HEADERS
+        if name not in required
     ]
 
     problems = []
@@ -296,10 +298,10 @@ def find_header_problem(header: Sequence[str] | None) -> str | None:
     return f"Invalid header: {'; '.join(problems)}." if problems else None
 
 
-def describe_unexpected(name: str) -> str:
+def describe_unexpected(name: str, required: Sequence[str] = REQUIRED_HEADERS) -> str:
     # Point out near-misses such as "SKU" or " sku" so the fix is obvious.
     normalized = name.strip().lower()
-    if normalized in REQUIRED_HEADERS:
+    if normalized in required:
         return f"'{name}' (expected '{normalized}')"
     return f"'{name}'"
 
