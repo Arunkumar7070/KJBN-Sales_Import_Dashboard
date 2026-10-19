@@ -1,4 +1,7 @@
-from datetime import UTC, datetime
+import csv
+import io
+import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -12,7 +15,7 @@ from api.routes import RateLimiter
 from app.config import get_settings
 from app.database import Base, get_db
 from app.main import app
-from app.models import ImportBatch, ImportPayload, Store, Transaction
+from app.models import ImportBatch, ImportPayload, ImportRowError, Store, Transaction
 from app.services import csv_validator
 
 FIXED_NOW = datetime(2026, 10, 17, 12, 0, tzinfo=UTC)
@@ -70,6 +73,7 @@ def client(session_factory, clock):
 
     limiter = RateLimiter(max_requests=3, clock=lambda: clock["now"])
     app.dependency_overrides[get_db] = test_db
+    app.dependency_overrides[routes.get_session_factory] = lambda: session_factory
     app.dependency_overrides[routes.get_upload_rate_limiter] = lambda: limiter
     with TestClient(app) as test_client:
         yield test_client
@@ -258,3 +262,218 @@ def test_swagger_documents_the_upload_endpoint(client):
 
     assert set(operation["responses"]) >= {"200", "202", "400", "422", "429", "503"}
     assert "multipart/form-data" in operation["requestBody"]["content"]
+
+
+# Batch history: GET /api/v1/imports
+
+
+def add_batches(session_factory, count, start=FIXED_NOW):
+    """Batches uploaded one minute apart; returns their IDs, oldest first."""
+    ids = []
+    with session_factory() as session:
+        for i in range(count):
+            batch = ImportBatch(
+                filename=f"day{i}.csv",
+                file_sha256=f"{i:064d}",
+                status="COMPLETED",
+                uploaded_at=start + timedelta(minutes=i),
+            )
+            session.add(batch)
+            session.flush()
+            ids.append(str(batch.id))
+        session.commit()
+    return ids
+
+
+def test_list_is_empty_without_batches(client):
+    response = client.get("/api/v1/imports")
+
+    assert response.status_code == 200
+    assert response.json() == {"items": [], "total": 0, "limit": 20, "offset": 0}
+
+
+def test_list_returns_newest_batches_first(client, session_factory):
+    ids = add_batches(session_factory, 3)
+
+    items = client.get("/api/v1/imports").json()["items"]
+
+    assert [item["id"] for item in items] == ids[::-1]
+    assert items[0]["filename"] == "day2.csv"
+    assert set(items[0]) >= {
+        "status",
+        "rows_total",
+        "rows_rejected",
+        "error_report_url",
+    }
+
+
+def test_list_pages_cover_every_batch_once(client, session_factory):
+    ids = add_batches(session_factory, 5)
+
+    pages = [
+        client.get("/api/v1/imports", params={"limit": 2, "offset": offset}).json()
+        for offset in (0, 2, 4)
+    ]
+
+    assert [len(page["items"]) for page in pages] == [2, 2, 1]
+    assert {page["total"] for page in pages} == {5}
+    assert [item["id"] for page in pages for item in page["items"]] == ids[::-1]
+
+
+def test_list_breaks_upload_time_ties_by_id(client, session_factory):
+    with session_factory() as session:
+        for i in range(3):
+            session.add(
+                ImportBatch(
+                    filename=f"same{i}.csv",
+                    file_sha256=f"{i:064d}",
+                    status="QUEUED",
+                    uploaded_at=FIXED_NOW,
+                )
+            )
+        session.commit()
+
+    first = client.get("/api/v1/imports", params={"limit": 2}).json()["items"]
+    second = client.get("/api/v1/imports", params={"limit": 2, "offset": 2}).json()[
+        "items"
+    ]
+
+    ids = [item["id"] for item in first + second]
+    assert len(set(ids)) == 3
+    assert ids == sorted(ids, key=uuid.UUID, reverse=True)
+
+
+def test_offset_past_the_end_returns_no_items(client, session_factory):
+    add_batches(session_factory, 2)
+
+    body = client.get("/api/v1/imports", params={"offset": 10}).json()
+
+    assert (body["items"], body["total"]) == ([], 2)
+
+
+@pytest.mark.parametrize(
+    "params",
+    [{"limit": 0}, {"limit": 101}, {"offset": -1}, {"limit": "ten"}],
+    ids=["limit-zero", "limit-over-max", "negative-offset", "not-a-number"],
+)
+def test_invalid_paging_parameters_are_rejected(client, params):
+    assert client.get("/api/v1/imports", params=params).status_code == 422
+
+
+# Rejected rows: GET /api/v1/imports/{batch_id}/errors.csv
+
+
+def read_csv(response):
+    text = response.content.decode("utf-8")
+    assert text.startswith("\ufeff")  # BOM so Excel reads UTF-8.
+    return list(csv.reader(io.StringIO(text.removeprefix("\ufeff"))))
+
+
+def test_error_csv_lists_rejected_rows(client, session_factory):
+    rows = (
+        HEADER
+        + "T1,ST01,2026-10-17 09:00:00,SKU1,Masala Chai,1,100.00,0,UPI,\n"
+        + "T2,ST01,2026-10-17 09:00:00,SKU1,Masala Chai,1,100.00,0,CHEQUE,\n"
+        + "T3,ST01\n"
+        + 'T4,ST99,2026-10-17 09:00:00,SKU1,"Chai, ""special""",1,1,0,UPI,\n'
+    ).encode()
+    batch_id = upload(client, ("day1.csv", rows)).json()["queued_batch_ids"][0]
+
+    response = client.get(f"/api/v1/imports/{batch_id}/errors.csv")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "text/csv; charset=utf-8"
+    assert response.headers["content-disposition"] == (
+        f'attachment; filename="batch-{batch_id}-errors.csv"'
+    )
+    assert read_csv(response) == [
+        ["row_number", "column_name", "message", "transaction_id"],
+        [
+            "3",
+            "payment_mode",
+            "payment_mode must be CASH, UPI or CARD; got 'CHEQUE'.",
+            "T2",
+        ],
+        ["4", "__row__", "Row has 2 column(s); expected 10.", ""],
+        ["5", "store_code", "Store code 'ST99' does not exist.", "T4"],
+    ]
+
+
+def test_error_csv_for_batch_without_rejections_is_header_only(client):
+    batch_id = upload(client, ("day1.csv", sales_csv("T1"))).json()["queued_batch_ids"][
+        0
+    ]
+
+    response = client.get(f"/api/v1/imports/{batch_id}/errors.csv")
+
+    assert response.status_code == 200
+    assert read_csv(response) == [
+        ["row_number", "column_name", "message", "transaction_id"]
+    ]
+
+
+def test_error_csv_for_unknown_batch_is_404(client):
+    response = client.get(f"/api/v1/imports/{uuid.uuid4()}/errors.csv")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Batch not found."}
+
+
+def test_error_csv_with_malformed_batch_id_is_422(client):
+    assert client.get("/api/v1/imports/not-a-uuid/errors.csv").status_code == 422
+
+
+def add_row_errors(session_factory, errors):
+    with session_factory() as session:
+        batch = ImportBatch(filename="x.csv", file_sha256="e" * 64, status="COMPLETED")
+        session.add(batch)
+        session.flush()
+        session.add_all(
+            ImportRowError(
+                batch_id=batch.id,
+                row_number=row,
+                column_name=column,
+                message=message,
+                transaction_id=transaction_id,
+            )
+            for row, column, message, transaction_id in errors
+        )
+        session.commit()
+        return batch.id
+
+
+@pytest.mark.parametrize(
+    ("transaction_id", "exported"),
+    [
+        ('=HYPERLINK("http://evil")', '\'=HYPERLINK("http://evil")'),
+        ("+1+2", "'+1+2"),
+        ("-5", "'-5"),
+        ("@SUM(A1)", "'@SUM(A1)"),
+        ("T-1", "T-1"),  # Only a leading character matters.
+    ],
+)
+def test_error_csv_neutralises_spreadsheet_formulas(
+    client, session_factory, transaction_id, exported
+):
+    batch_id = add_row_errors(
+        session_factory, [(2, "store_code", "bad", transaction_id)]
+    )
+
+    rows = read_csv(client.get(f"/api/v1/imports/{batch_id}/errors.csv"))
+
+    assert rows[1] == ["2", "store_code", "bad", exported]
+
+
+def test_error_csv_streams_large_batches_completely_in_row_order(
+    client, session_factory
+):
+    count = routes.ERROR_CSV_CHUNK_ROWS * 2 + 7  # Spans several chunks.
+    errors = [
+        (row, "sku", f"error {row}", f"T{row}") for row in range(count + 1, 1, -1)
+    ]
+    batch_id = add_row_errors(session_factory, errors)
+
+    rows = read_csv(client.get(f"/api/v1/imports/{batch_id}/errors.csv"))
+
+    assert len(rows) == count + 1
+    assert [int(row[0]) for row in rows[1:]] == list(range(2, count + 2))

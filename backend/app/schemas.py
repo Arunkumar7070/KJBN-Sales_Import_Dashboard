@@ -87,6 +87,17 @@ class BatchResponse(BaseModel):
         return f"/api/v1/imports/{self.id}/errors.csv"
 
 
+class BatchListResponse(BaseModel):
+    """One page of batches, newest upload first."""
+
+    items: list[BatchResponse]
+    total: int = Field(
+        ge=0, description="Number of batches across all pages.", examples=[57]
+    )
+    limit: int = Field(description="Page size used for this response.", examples=[20])
+    offset: int = Field(description="Batches skipped before this page.", examples=[0])
+
+
 class TransactionResponse(BaseModel):
     """One imported sale (positive quantity) or return (negative quantity)."""
 
