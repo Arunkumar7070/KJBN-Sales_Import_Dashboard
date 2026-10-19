@@ -36,4 +36,6 @@ def test_database_health_returns_503_without_leaking_details():
     response = client_with_session(FakeSession(error)).get("/health/db")
 
     assert response.status_code == 503
-    assert response.json() == {"detail": "Database unavailable"}
+    assert response.json()["error"]["code"] == "service_unavailable"
+    assert response.json()["error"]["message"] == "Database unavailable"
+    assert "password" not in response.text

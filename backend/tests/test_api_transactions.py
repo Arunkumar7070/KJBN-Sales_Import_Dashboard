@@ -253,7 +253,9 @@ def test_date_from_after_date_to_is_rejected_with_message(client):
     )
 
     assert response.status_code == 422
-    assert response.json() == {"detail": "date_from must be on or before date_to."}
+    assert (
+        response.json()["error"]["message"] == "date_from must be on or before date_to."
+    )
 
 
 def test_ist_day_boundaries_are_exact(client, session_factory):

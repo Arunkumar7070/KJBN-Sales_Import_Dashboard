@@ -232,10 +232,11 @@ def test_invalid_header_returns_400(client, test_clock_enabled, bad):
     response = client.get("/api/v1/stores", headers={"X-Test-Clock": bad})
 
     assert response.status_code == 400
-    assert response.json() == {
-        "detail": "Invalid X-Test-Clock header: expected an ISO-8601 date-time "
+    assert response.json()["error"]["code"] == "bad_request"
+    assert response.json()["error"]["message"] == (
+        "Invalid X-Test-Clock header: expected an ISO-8601 date-time "
         "such as 2026-10-17T09:00:00Z."
-    }
+    )
 
 
 def test_header_is_ignored_when_not_enabled(client, session_factory):

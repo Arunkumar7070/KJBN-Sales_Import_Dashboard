@@ -172,7 +172,8 @@ def test_too_many_files_in_one_request_is_rejected(client, monkeypatch):
     response = upload(client, *files)
 
     assert response.status_code == 400
-    assert response.json()["detail"] == "At most 2 files per upload; got 3."
+    assert response.json()["error"]["code"] == "bad_request"
+    assert response.json()["error"]["message"] == "At most 2 files per upload; got 3."
 
 
 def test_request_without_files_is_a_validation_error(client):
@@ -190,7 +191,11 @@ def test_database_down_returns_503_without_details(client, monkeypatch):
     response = upload(client, ("day1.csv", sales_csv("T1")))
 
     assert response.status_code == 503
-    assert response.json() == {"detail": "Database unavailable. Please try again."}
+    assert response.json()["error"]["code"] == "service_unavailable"
+    assert (
+        response.json()["error"]["message"] == "Database unavailable. Please try again."
+    )
+    assert "password" not in response.text
 
 
 # Rate limiting (fixture limit: 3 uploads per 60 seconds per client)
@@ -207,7 +212,11 @@ def test_fourth_upload_within_a_minute_gets_429(client, clock):
     assert (
         response.headers["Retry-After"] == "30"
     )  # First upload leaves the window at +60s.
-    assert response.json() == {"detail": "Too many uploads. Try again in 30 seconds."}
+    assert response.json()["error"]["code"] == "too_many_requests"
+    assert (
+        response.json()["error"]["message"]
+        == "Too many uploads. Try again in 30 seconds."
+    )
 
 
 def test_uploads_are_allowed_again_after_the_window(client, clock):
@@ -416,7 +425,8 @@ def test_error_csv_for_unknown_batch_is_404(client):
     response = client.get(f"/api/v1/imports/{uuid.uuid4()}/errors.csv")
 
     assert response.status_code == 404
-    assert response.json() == {"detail": "Batch not found."}
+    assert response.json()["error"]["code"] == "not_found"
+    assert response.json()["error"]["message"] == "Batch not found."
 
 
 def test_error_csv_with_malformed_batch_id_is_422(client):
