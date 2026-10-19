@@ -7,17 +7,36 @@ Response models read straight from SQLAlchemy objects (from_attributes=True).
 """
 
 import uuid
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, computed_field
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    computed_field,
+)
 
 # Same values as the CHECK constraints in app/models.py.
 BatchStatus = Literal["QUEUED", "PROCESSING", "COMPLETED", "REJECTED_HEADER", "FAILED"]
 PaymentMode = Literal["CASH", "UPI", "CARD"]
 
 PAISE_PER_RUPEE = 100
+
+
+def as_utc(value: datetime) -> datetime:
+    """Express a database timestamp in UTC, so every response uses one offset.
+
+    PostgreSQL returns timestamptz in the connection's time zone (which varies
+    by server), and some drivers (e.g. SQLite) return it with no time zone.
+    """
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+UtcDatetime = Annotated[datetime, AfterValidator(as_utc)]
 
 
 class Money(BaseModel):
@@ -57,11 +76,13 @@ class BatchResponse(BaseModel):
         description="Original file name.", examples=["sales_2026-10-17.csv"]
     )
     status: BatchStatus = Field(description="Where the import is in its lifecycle.")
-    uploaded_at: datetime = Field(description="When the file was uploaded (UTC).")
-    started_at: datetime | None = Field(
+    uploaded_at: UtcDatetime = Field(description="When the file was uploaded (UTC).")
+    started_at: UtcDatetime | None = Field(
         description="When processing last started (UTC)."
     )
-    completed_at: datetime | None = Field(description="When processing finished (UTC).")
+    completed_at: UtcDatetime | None = Field(
+        description="When processing finished (UTC)."
+    )
     rows_total: int = Field(ge=0, description="Data rows in the file.", examples=[120])
     rows_accepted: int = Field(
         ge=0, description="Rows saved as transactions.", examples=[117]
@@ -107,7 +128,7 @@ class TransactionResponse(BaseModel):
         description="Transaction ID from the CSV.", examples=["T1001"]
     )
     store_code: str = Field(description="Store that made the sale.", examples=["ST01"])
-    sold_at: datetime = Field(
+    sold_at: UtcDatetime = Field(
         description="Sale time in UTC (the CSV gives IST).",
         examples=["2026-10-17T03:30:00Z"],
     )
@@ -136,7 +157,32 @@ class TransactionResponse(BaseModel):
         examples=[None],
     )
     batch_id: uuid.UUID = Field(description="Batch (uploaded file) this row came from.")
-    created_at: datetime = Field(description="When the row was saved (UTC).")
+    created_at: UtcDatetime = Field(description="When the row was saved (UTC).")
+
+
+class TransactionListResponse(BaseModel):
+    """One page of transactions matching the filters, newest sale first."""
+
+    items: list[TransactionResponse]
+    total: int = Field(
+        ge=0,
+        description="Transactions matching the filters, across all pages.",
+        examples=[245],
+    )
+    page: int = Field(
+        ge=1, description="Page number of this response (1-based).", examples=[1]
+    )
+    limit: int = Field(
+        ge=1, description="Page size used for this response.", examples=[20]
+    )
+
+    @computed_field(
+        description="Number of pages for these filters and this page size.",
+        examples=[13],
+    )
+    @property
+    def pages(self) -> int:
+        return -(-self.total // self.limit)  # Ceiling division.
 
 
 # Dashboard analytics

@@ -1,4 +1,4 @@
-"""Import endpoints: upload sales CSV files, list batches, download row errors."""
+"""API endpoints: CSV imports (upload, history, row errors) and transaction search."""
 
 import csv
 import io
@@ -9,6 +9,8 @@ import time
 import uuid
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterator
+from datetime import UTC, date, datetime, timedelta
+from datetime import time as clock_time
 from pathlib import Path
 from typing import Annotated
 
@@ -24,20 +26,23 @@ from fastapi import (
     status,
 )
 from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import ColumnElement, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import get_settings
 from app.database import SessionLocal, get_db
-from app.models import ImportBatch, ImportRowError
+from app.models import ImportBatch, ImportRowError, Transaction
 from app.schemas import (
     BatchListResponse,
     BatchResponse,
     ImportUploadResponse,
+    TransactionListResponse,
+    TransactionResponse,
     UploadedFileResult,
 )
 from app.services.csv_validator import INVALID, enqueue_upload, run_worker
+from app.services.sales_rules import IST
 
 logger = logging.getLogger(__name__)
 
@@ -302,3 +307,95 @@ def error_csv_chunks(
 
 def safe_cell(value: str) -> str:
     return f"'{value}" if value.startswith(FORMULA_PREFIXES) else value
+
+
+transactions_router = APIRouter(prefix="/api/v1", tags=["Transactions"])
+
+
+@transactions_router.get(
+    "/transactions",
+    response_model=TransactionListResponse,
+    summary="Search transactions",
+    description=(
+        "All filters are optional and combine with AND. Dates are IST calendar "
+        "days and both ends are inclusive. Results are newest sale first."
+    ),
+)
+def list_transactions(
+    db: Annotated[Session, Depends(get_db)],
+    store_code: Annotated[
+        str | None,
+        Query(description="Only this store (exact match).", examples=["ST01"]),
+    ] = None,
+    sku: Annotated[
+        str | None,
+        Query(description="Only this product (exact match).", examples=["SKU1"]),
+    ] = None,
+    date_from: Annotated[
+        date | None, Query(description="First day to include (IST), YYYY-MM-DD.")
+    ] = None,
+    date_to: Annotated[
+        date | None, Query(description="Last day to include (IST), YYYY-MM-DD.")
+    ] = None,
+    returns_only: Annotated[
+        bool, Query(description="true: only returns. false: sales and returns.")
+    ] = False,
+    page: Annotated[int, Query(ge=1, description="Page number, starting at 1.")] = 1,
+    limit: Annotated[
+        int, Query(ge=1, le=MAX_PAGE_SIZE, description="Transactions per page.")
+    ] = DEFAULT_PAGE_SIZE,
+):
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="date_from must be on or before date_to.",
+        )
+    # Built once and used by both queries, so total always matches the items.
+    filters = transaction_filters(store_code, sku, date_from, date_to, returns_only)
+
+    total = db.scalar(select(func.count()).select_from(Transaction).where(*filters))
+    transactions = db.scalars(
+        select(Transaction)
+        .where(*filters)
+        # transaction_id breaks ties so pages never overlap or skip rows.
+        .order_by(Transaction.sold_at.desc(), Transaction.transaction_id.desc())
+        .limit(limit)
+        .offset((page - 1) * limit)
+    ).all()
+    return TransactionListResponse(
+        items=[TransactionResponse.model_validate(t) for t in transactions],
+        total=total,
+        page=page,
+        limit=limit,
+    )
+
+
+def transaction_filters(
+    store_code: str | None,
+    sku: str | None,
+    date_from: date | None,
+    date_to: date | None,
+    returns_only: bool,
+) -> list[ColumnElement[bool]]:
+    """WHERE conditions for the filters that were given; none means everything."""
+    filters = []
+    if store_code is not None:
+        filters.append(Transaction.store_code == store_code)
+    if sku is not None:
+        filters.append(Transaction.sku == sku)
+    if date_from is not None:
+        filters.append(Transaction.sold_at >= start_of_ist_day(date_from))
+    if date_to is not None:
+        # Before the next day's midnight, so every moment of date_to is included.
+        filters.append(
+            Transaction.sold_at < start_of_ist_day(date_to + timedelta(days=1))
+        )
+    if returns_only:
+        filters.append(Transaction.is_return.is_(True))
+    return filters
+
+
+def start_of_ist_day(day: date) -> datetime:
+    # sold_at is stored in UTC; midnight IST is 18:30 UTC the day before.
+    # Converted to UTC so drivers that ignore time zones (SQLite) compare correctly.
+    return datetime.combine(day, clock_time.min, tzinfo=IST).astimezone(UTC)

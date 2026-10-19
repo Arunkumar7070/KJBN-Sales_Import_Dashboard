@@ -1,5 +1,5 @@
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -166,3 +166,21 @@ def test_swagger_documents_the_response_models():
         "PaymentSplit",
     ):
         assert name in schemas
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        datetime(2026, 10, 17, 9, 0, tzinfo=timezone(timedelta(hours=5, minutes=30))),
+        datetime(2026, 10, 17, 3, 30),  # No time zone, as SQLite returns it.
+        datetime(2026, 10, 17, 3, 30, tzinfo=UTC),
+    ],
+    ids=["ist-session", "naive", "utc"],
+)
+def test_timestamps_are_always_returned_in_utc(stored):
+    transaction = a_return()
+    transaction.sold_at = stored
+
+    data = TransactionResponse.model_validate(transaction).model_dump(mode="json")
+
+    assert data["sold_at"] == "2026-10-17T03:30:00Z"
