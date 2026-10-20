@@ -1,0 +1,6 @@
+transaction_id,store_code,sold_at,sku,product_name,quantity,unit_price,discount,original_transaction_id
+T-00701,ST04,2026-10-10 08:00:09,SKU-126,Toothpaste 150g,2,92.00,0.00,
+T-00702,ST03,2026-10-10 20:01:17,SKU-119,Hand Wash 250ml,2,85.00,20.00,
+T-00703,ST04,2026-10-11 16:43:06,SKU-126,Toothpaste 150g,1,92.00,20.00,
+T-00704,ST06,2026-10-10 18:51:39,SKU-119,Hand Wash 250ml,2,85.00,20.00,
+T-00705,ST03,2026-10-09 13:51:26,SKU-103,Wheat Atta 5kg,5,245.00,5.00,
