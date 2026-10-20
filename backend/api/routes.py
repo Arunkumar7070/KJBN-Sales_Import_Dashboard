@@ -142,6 +142,26 @@ def enforce_upload_rate_limit(
         503: {"description": "Database unavailable."},
     },
     dependencies=[Depends(enforce_upload_rate_limit)],
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["files"],
+                        "properties": {
+                            "files": {
+                                "type": "array",
+                                "items": {"type": "string", "format": "binary"},
+                                "description": "One or more sales CSV files.",
+                            }
+                        },
+                    }
+                }
+            },
+        }
+    },
 )
 def upload_imports(
     files: Annotated[
