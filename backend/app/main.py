@@ -5,6 +5,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -172,6 +173,26 @@ async def correlate_and_log_request(request: Request, call_next):
             extra=request_log_fields(request, response.status_code, started),
         )
         return response
+
+
+# Added last, so it runs outermost: preflight requests are answered here, and
+# every response, including 4xx/5xx errors, carries the CORS headers (without
+# them the browser hides the real error behind a CORS failure).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_settings().cors_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        REQUEST_ID_HEADER,
+        TEST_CLOCK_HEADER,
+    ],
+    # Response headers the frontend's JavaScript may read.
+    expose_headers=[REQUEST_ID_HEADER, "Retry-After", "Content-Disposition"],
+    max_age=600,  # Browsers may cache a preflight answer for 10 minutes.
+)
 
 
 def request_log_fields(request: Request, status_code: int, started: float) -> dict:
