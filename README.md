@@ -669,14 +669,7 @@ None of these breaks a Core rule; they are trade-offs or gaps worth knowing abou
 ## 12. AI and third-party usage
 
 - **Claude Code (Anthropic, Claude Opus):**
-  - **Backend:** implementing and refactoring the backend to my specifications: CSV validation, sales rules, the import pipeline (two-phase in-memory validation, chunked inserts), API endpoints, error handling, logging, and the tests.
-  - **Frontend:** building the React UI from the design files.
-  - **Infrastructure:** the GitHub Actions workflow, Dockerfiles and `docker-compose.yml`.
-  - **Explanation and review:** analysing the codebase against the assignment and explaining code.
-  - **Drafting:** this README and some of my prompts.
-  - **Guidance file:** `CLAUDE.md` at the repo root holds my engineering rules for it.
-- **Claude (Anthropic, Fable 5.1 model):** restructuring this README and drafting its Mermaid diagrams.
-- **Google Stitch:** generated the UI design references (layout, colours, typography) that the frontend implements.
-- **Libraries:** as listed in `backend/requirements.txt` and `frontend/vite-project/package.json`. No templates or copied project code.
+  implementing and refactoring the backend to my specifications:
+- **Google Stitch:** generated the UI design references 
 
 **Prompt log:** [PROMPTS.md](PROMPTS.md): every prompt in order, with the time, the tool, and what I did with each answer (used as-is, edited or rejected).
