@@ -35,5 +35,17 @@ services:
       retries: 5
       start_period: 60s  # Migrations and the seed run before the server starts.
 
+  frontend:
+    build:
+      context: ./frontend/vite-project
+      args:
+        # Baked into the bundle; the reviewer's browser calls the API here.
+        VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      backend:
+        condition: service_healthy
+
 volumes:
   db-data:
