@@ -1,0 +1,20 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      # Throwaway credentials for local use only, not real secrets.
+      POSTGRES_USER: kjbn
+      POSTGRES_PASSWORD: kjbn
+      POSTGRES_DB: kjbn
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kjbn -d kjbn"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  db-data:
