@@ -15,7 +15,9 @@ import sys
 import time
 import uuid
 from collections import Counter
-from collections.abc import Collection
+from collections.abc import Collection, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -40,6 +42,25 @@ from app.services.csv_parser import (
 from app.services.sales_importer import process_batch
 
 logger = logging.getLogger(__name__)
+
+# Plain-text progress for people running the CLI or the seed script. The API's
+# background imports switch it off (without_echo): there the structured logs
+# written by process_batch and the functions below are the record.
+_echo_enabled: ContextVar[bool] = ContextVar("echo_enabled", default=True)
+
+
+def echo(message: str, *, to_stderr: bool = False) -> None:
+    if _echo_enabled.get():
+        print(message, file=sys.stderr if to_stderr else sys.stdout)
+
+
+@contextmanager
+def without_echo() -> Iterator[None]:
+    token = _echo_enabled.set(False)
+    try:
+        yield
+    finally:
+        _echo_enabled.reset(token)
 
 # Settings for worker retries and recovery
 MAX_IMPORT_ATTEMPTS = 3
@@ -173,13 +194,13 @@ def record_batch(result: FileCheckResult) -> FileOutcome:
 def report_completed(
     path: Path, batch: ImportBatch, errors: list[RowError]
 ) -> FileOutcome:
-    """Prints and returns summary statistics for a completed batch."""
-    print(
+    """Echoes and returns summary statistics for a completed batch."""
+    echo(
         f"Batch {batch.id} COMPLETED: {batch.rows_total} rows, "
         f"{batch.rows_accepted} accepted, {batch.rows_rejected} rejected."
     )
     for error in errors:
-        print(f"Row {error.row_number} [{error.column_name}]: {error.message}")
+        echo(f"Row {error.row_number} [{error.column_name}]: {error.message}")
     return FileOutcome(
         path,
         IMPORTED,
@@ -282,7 +303,7 @@ def run_worker(
             outcome = run_next_batch(batch_ids)
         except SQLAlchemyError:
             logger.exception("Worker could not reach the database")
-            print("ERROR worker: database unavailable.", file=sys.stderr)
+            echo("ERROR worker: database unavailable.", to_stderr=True)
             if drain:
                 return [
                     *outcomes,
@@ -374,7 +395,19 @@ def schedule_retry_or_give_up(session: Session, batch: ImportBatch) -> FileOutco
             "saved. Upload the same file again to retry."
         )
     session.commit()
-    print(f"Batch {batch.id} FAILED: {batch.failure_reason}", file=sys.stderr)
+    logger.warning(
+        "Batch %s failed: %s",
+        batch.id,
+        batch.failure_reason,
+        extra={
+            "batch_id": batch.id,
+            "file_name": batch.filename,
+            "attempt": attempts,
+            "max_attempts": MAX_IMPORT_ATTEMPTS,
+            "will_retry": attempts < MAX_IMPORT_ATTEMPTS,
+        },
+    )
+    echo(f"Batch {batch.id} FAILED: {batch.failure_reason}", to_stderr=True)
     return FileOutcome(Path(batch.filename), FAILED, batch.failure_reason)
 
 
@@ -392,7 +425,14 @@ def finish_without_import(
     batch.failure_reason = reason
     batch.completed_at = utc_now()
     session.commit()
-    print(f"Batch {batch.id} {status}: {reason}", file=sys.stderr)
+    logger.warning(
+        "Batch %s %s: %s",
+        batch.id,
+        status,
+        reason,
+        extra={"batch_id": batch.id, "file_name": batch.filename, "status": status},
+    )
+    echo(f"Batch {batch.id} {status}: {reason}", to_stderr=True)
     return FileOutcome(Path(batch.filename), INVALID, reason)
 
 

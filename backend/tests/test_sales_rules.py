@@ -252,3 +252,42 @@ def test_returns_beyond_original_quantity_are_rejected(
         original=ORIGINAL_SALE,
         already_returned=already_returned,
     )
+
+
+# Parsing CSV text, and the limits of what can be stored
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["2026-02-31 10:00:00", "2026-13-01 10:00:00", "2026-10-17 24:00:00"],
+)
+def test_well_formed_but_impossible_sold_at_is_rejected(rules, text):
+    with pytest.raises(rules.SaleRuleViolation) as excinfo:
+        rules.parse_sold_at(text)
+    assert excinfo.value.code == "INVALID_SOLD_AT"
+
+
+def test_sold_at_is_read_as_ist_and_converted_to_utc(rules):
+    assert rules.parse_sold_at("2026-10-17 09:00:00") == datetime(
+        2026, 10, 17, 3, 30, tzinfo=UTC
+    )
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+def test_largest_storable_quantity_is_accepted_and_one_more_is_rejected(rules, sign):
+    largest = sign * rules.MAX_QUANTITY
+    assert rules.parse_quantity(str(largest)) == largest
+    with pytest.raises(rules.SaleRuleViolation) as excinfo:
+        rules.parse_quantity(str(largest + sign))
+    assert excinfo.value.code == "INVALID_QUANTITY"
+
+
+def test_largest_storable_line_amount_is_accepted_and_one_more_is_rejected(
+    rules, validate, assert_rejected
+):
+    # MAX_PAISE is 2**63 - 1 (BIGINT); 2 units at 2**62 paise come to 2**63.
+    validate(sale(quantity=1, unit_price_paise=rules.MAX_PAISE))
+    assert_rejected(
+        "AMOUNT_TOO_LARGE",
+        sale(quantity=2, unit_price_paise=(rules.MAX_PAISE + 1) // 2),
+    )

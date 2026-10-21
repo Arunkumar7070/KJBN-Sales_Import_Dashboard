@@ -183,6 +183,40 @@ def test_logs_inside_a_request_carry_its_id_and_path(client, json_logs, monkeypa
     assert request_lines(lines)[0]["status_code"] == 503
 
 
+def test_rejected_rows_are_logged_as_a_warning_with_batch_context(
+    client, json_logs, capsys
+):
+    rows = (
+        "T1,ST01,2026-10-17 09:00:00,SKU1,Masala Chai,1,100.00,0,UPI,\n"
+        "T2,ST99,2026-10-17 09:05:00,SKU1,Masala Chai,1,100.00,0,UPI,\n"
+    )
+
+    response = client.post(
+        "/api/v1/imports",
+        files=[("files", ("day1.csv", (CSV_HEADER + rows).encode(), "text/csv"))],
+        headers={"X-Request-ID": "trace-rules"},
+    )
+
+    batch_id = response.json()["queued_batch_ids"][0]
+    logs = [line for line in json_logs() if line.get("batch_id") == batch_id]
+    completed = next(line for line in logs if line["level"] == "INFO")
+    [warning] = [line for line in logs if line["level"] == "WARNING"]
+    assert (completed["rows_accepted"], completed["rows_rejected"]) == (1, 1)
+    assert warning["request_id"] == "trace-rules"
+    assert (warning["file_name"], warning["rows_rejected"]) == ("day1.csv", 1)
+    assert warning["rejected_by_column"] == {"store_code": 1}
+    assert warning["examples"] == [
+        {
+            "row_number": 3,
+            "column": "store_code",
+            "transaction_id": "T2",
+            "message": "Store code 'ST99' does not exist.",
+        }
+    ]
+    # The API's background import writes only JSON logs, no plain-text lines.
+    assert capsys.readouterr().out == ""
+
+
 def test_background_import_logs_carry_the_upload_request_id(
     client, json_logs, monkeypatch
 ):

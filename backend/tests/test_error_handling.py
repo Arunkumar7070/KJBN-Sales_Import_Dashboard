@@ -7,9 +7,11 @@ import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from api import routes
 from api.routes import RateLimiter
+from app.database import get_db
 from app.logging_config import JsonFormatter
 from app.main import INTERNAL_ERROR_MESSAGE, app, handle_unexpected_error
 
@@ -203,6 +205,61 @@ def test_unexpected_error_is_logged_with_traceback_and_request_id(client, json_l
     )
     assert "Traceback" in line["exception"]
     assert "hunter2" in line["exception"]  # Full detail stays in the log.
+
+
+def database_down(*args, **kwargs):
+    raise OperationalError(
+        "SELECT 1", {}, Exception("connection refused: password=hunter2")
+    )
+
+
+def test_database_outage_on_a_read_endpoint_is_a_clean_503(
+    client, monkeypatch, json_logs
+):
+    monkeypatch.setattr(routes, "build_dashboard", database_down)
+
+    response = client.get(
+        "/api/v1/analytics/dashboard", headers={"X-Request-ID": "trace-db"}
+    )
+
+    assert response.status_code == 503
+    assert error_of(response) == {
+        "status": 503,
+        "code": "service_unavailable",
+        "message": "Database unavailable. Please try again.",
+        "request_id": "trace-db",
+    }
+    assert "hunter2" not in response.text
+    [line] = [line for line in json_logs() if line["message"] == "Database unavailable"]
+    assert (line["level"], line["request_id"], line["status_code"]) == (
+        "ERROR",
+        "trace-db",
+        503,
+    )
+
+
+def test_store_list_with_the_database_down_is_503(client):
+    class UnreachableSession:
+        scalars = database_down
+
+    app.dependency_overrides[get_db] = lambda: UnreachableSession()
+
+    response = client.get("/api/v1/stores")
+
+    assert response.status_code == 503
+    assert error_of(response)["code"] == "service_unavailable"
+
+
+def test_other_database_errors_stay_a_500(client, monkeypatch):
+    def broken_query(*args, **kwargs):
+        raise IntegrityError("INSERT", {}, Exception("duplicate key"))
+
+    monkeypatch.setattr(routes, "build_dashboard", broken_query)
+
+    response = client.get("/api/v1/analytics/dashboard")
+
+    assert response.status_code == 500
+    assert error_of(response)["code"] == "internal_server_error"
 
 
 def test_crash_inside_a_real_endpoint_is_a_clean_500(client, monkeypatch):

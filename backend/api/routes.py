@@ -53,6 +53,7 @@ from app.services.csv_validator import (
     enqueue_upload,
     run_worker,
 )
+from app.services.import_worker import without_echo
 from app.services.store_import import import_stores
 
 logger = logging.getLogger(__name__)
@@ -220,7 +221,7 @@ def import_in_background(
     safe because each batch is claimed atomically. Logs carry the request ID of
     the upload that started the import.
     """
-    with request_context(request_id), clock.frozen_at(frozen_now):
+    with request_context(request_id), clock.frozen_at(frozen_now), without_echo():
         run_worker(drain=True, batch_ids=batch_ids if frozen_now else None)
 
 

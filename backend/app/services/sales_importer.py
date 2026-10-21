@@ -113,10 +113,15 @@ def process_batch(
         batch.status = "COMPLETED"
         batch.completed_at = clock.utc_now()
         session.commit()
+        log_completed_batch(batch, errors)
         return errors
     except (SQLAlchemyError, ImportConflictError):
         session.rollback()
-        logger.exception("Import of batch %s failed", batch.id)
+        logger.exception(
+            "Import of batch %s failed",
+            batch.id,
+            extra={"batch_id": batch.id, "file_name": batch.filename},
+        )
         batch.status = "FAILED"
         batch.failure_reason = (
             "Database error while saving rows; nothing was saved. "
@@ -125,6 +130,44 @@ def process_batch(
         batch.completed_at = clock.utc_now()
         session.commit()
         return []
+
+
+# Rejected rows quoted in the warning log; all of them are in the error report.
+LOGGED_REJECTION_EXAMPLES = 5
+
+
+def log_completed_batch(batch: ImportBatch, errors: list[RowError]) -> None:
+    """INFO with the batch's counts; WARNING with context if any row was rejected."""
+    fields = {
+        "batch_id": batch.id,
+        "file_name": batch.filename,
+        "rows_total": batch.rows_total,
+        "rows_accepted": batch.rows_accepted,
+        "rows_rejected": batch.rows_rejected,
+    }
+    logger.info("Import of batch %s completed", batch.id, extra=fields)
+    if not errors:
+        return
+    logger.warning(
+        "Batch %s: %d row(s) rejected by validation or business rules",
+        batch.id,
+        len(errors),
+        extra={
+            **fields,
+            "rejected_by_column": dict(
+                Counter(error.column_name for error in errors).most_common()
+            ),
+            "examples": [
+                {
+                    "row_number": error.row_number,
+                    "column": error.column_name,
+                    "transaction_id": error.transaction_id,
+                    "message": error.message,
+                }
+                for error in errors[:LOGGED_REJECTION_EXAMPLES]
+            ],
+        },
+    )
 
 
 def import_rows(

@@ -7,7 +7,8 @@ from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -114,6 +115,11 @@ async def handle_validation_error(request: Request, exc: RequestValidationError)
 
 INTERNAL_ERROR_MESSAGE = "Something went wrong on our side. Please try again later."
 
+# Raised when the database can't be reached (connection refused or lost, pool
+# exhausted): a 503 the client can retry, not a bug. Other database errors stay 500.
+DATABASE_UNAVAILABLE_ERRORS = (OperationalError, InterfaceError, PoolTimeoutError)
+DATABASE_UNAVAILABLE_MESSAGE = "Database unavailable. Please try again."
+
 
 @app.exception_handler(Exception)
 async def handle_unexpected_error(request: Request, exc: Exception):
@@ -155,6 +161,18 @@ async def correlate_and_log_request(request: Request, call_next):
     with request_context(request_id, path):
         try:
             response = await call_next(request)
+        except DATABASE_UNAVAILABLE_ERRORS:
+            request_logger.exception(
+                "Database unavailable",
+                extra=request_log_fields(request, 503, started),
+            )
+            response = error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                DATABASE_UNAVAILABLE_MESSAGE,
+                request_id=request_id,
+            )
+            response.headers[REQUEST_ID_HEADER] = request_id
+            return response
         except Exception:
             request_logger.exception(
                 "Unhandled error",
