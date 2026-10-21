@@ -1,0 +1,23 @@
+Backend test coverage. Generated with (from backend/, TEST_POSTGRES_URL set so the
+PostgreSQL concurrency tests run too):
+    pytest --cov=app --cov=api --cov-report=term-missing
+
+Name                             Stmts   Miss  Cover   Missing
+--------------------------------------------------------------
+api/routes.py                      159      1    99%   108
+app/clock.py                        28      0   100%
+app/config.py                       32      0   100%
+app/database.py                     13      0   100%
+app/logging_config.py               48      0   100%
+app/main.py                         99      2    98%   77-78
+app/models.py                       84      0   100%
+app/schemas.py                     123      0   100%
+app/services/analytics.py           68      1    99%   51
+app/services/csv_parser.py         109      0   100%
+app/services/csv_validator.py        7      1    86%   102
+app/services/import_worker.py      255     14    95%   165, 222-229, 277-279, 312, 318, 359, 519
+app/services/sales_importer.py     177      0   100%
+app/services/sales_rules.py         93      0   100%
+app/services/store_import.py        72      0   100%
+--------------------------------------------------------------
+TOTAL                             1367     19    99%

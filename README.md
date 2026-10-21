@@ -14,13 +14,13 @@ A web app that ingests the daily sales CSVs of a six-store retail chain **row by
 
 | What | URL |
 | --- | --- |
-| UI | **TODO: Vercel URL** |
+| UI | https://vite-project-lovat-mu.vercel.app/ingestion |
 | API base URL | https://kjbn-sales-backend.onrender.com |
-| API docs (Swagger / OpenAPI) | https://kjbn-sales-backend.onrender.com/docs |
+| API docs (Swagger) | https://kjbn-sales-backend.onrender.com/docs#/ |
 | Health | https://kjbn-sales-backend.onrender.com/health · https://kjbn-sales-backend.onrender.com/health/db |
 
 - **No authentication**, so there are no test credentials. Anyone with the URL can upload (see §11).
-- **Seed data is loaded:** 6 stores and 5,003 sales from 1 Sep to 20 Oct 2026.
+- **Seed data is loaded:** 5,003 sales across the 6 stores, from 1 Sep to 20 Oct 2026. The hosted catalog also holds the 100-store sample catalog (`Sample_Data/stores_100.csv`) and one upload of `sample_sales.csv`.
 - **Cold start:** the backend runs on Render's free tier and sleeps after inactivity, so the first request after a pause takes **30–60 s**. The Neon database also suspends when idle and wakes on the first query. Both recover on their own; just retry.
 
 ## 3. Tech stack
@@ -136,7 +136,31 @@ sequenceDiagram
 
 A `PROCESSING` batch older than 1 hour counts as stale and may be claimed again (see §11).
 
-### 4.4 Data model (simplified)
+```mermaid
+stateDiagram-v2
+    [*] --> QUEUED: upload with a new file hash
+    QUEUED --> PROCESSING: claimed by one worker (atomic UPDATE)
+    PROCESSING --> COMPLETED: rows written, payload deleted
+    PROCESSING --> REJECTED_HEADER: bad header, payload deleted
+    PROCESSING --> FAILED: database error or unreadable file
+    FAILED --> PROCESSING: retried while the payload is staged
+    PROCESSING --> PROCESSING: reclaimed when stale (after 1 hour)
+    COMPLETED --> [*]
+    REJECTED_HEADER --> [*]
+
+    note right of FAILED
+        Database error: everything rolls back and the payload is kept,
+        so the worker retries it (3 attempts in total).
+        Unreadable file, or all 3 attempts used: the payload is deleted.
+        Re-uploading the same file stages it again for one more try.
+    end note
+```
+
+A worker only claims batches whose payload is still staged. Re-uploading a `COMPLETED` or `REJECTED_HEADER` file changes nothing and reports `ALREADY UPLOADED`.
+
+### 4.4 Data model
+
+Seven tables, defined in `backend/app/models.py` and created by the Alembic migrations in `backend/migrations/`. `alembic check` confirms the two match. Every column is `NOT NULL` unless marked "nullable".
 
 ```mermaid
 erDiagram
@@ -156,51 +180,76 @@ erDiagram
     PRODUCT {
         text sku PK
         text name "first name seen wins"
+        timestamptz created_at
     }
     PRODUCT_ALIAS {
         bigint id PK
         text sku FK
         text alias_name "unique per sku"
+        timestamptz first_seen_at
     }
     IMPORT_BATCH {
         uuid id PK
         text filename
-        text file_sha256 UK
-        text status
+        char file_sha256 UK "64 hex characters"
+        timestamptz uploaded_at
+        timestamptz started_at "nullable"
+        timestamptz completed_at "nullable"
+        text status "QUEUED to FAILED, see 4.3"
         int rows_total
         int rows_accepted
         int rows_rejected
-        timestamptz uploaded_at
+        text failure_reason "nullable"
+        int attempt_count
     }
     IMPORT_PAYLOAD {
-        uuid batch_id PK
-        bytea csv_gzip
+        uuid batch_id PK, FK
+        bytea csv_gzip "gzip of the original bytes"
+        bigint received_size_bytes
+        timestamptz created_at
     }
     TRANSACTION {
         text transaction_id PK
-        timestamptz sold_at "UTC"
-        int quantity "not 0"
-        bigint unit_price_paise "at least 0"
-        bigint discount_paise "at least 0"
+        text store_code FK
+        timestamptz sold_at "stored in UTC"
+        text sku FK
+        text product_name "name as written in the file"
+        int quantity "not 0, negative for a return"
+        bigint unit_price_paise
+        bigint discount_paise
+        text payment_mode "CASH, UPI or CARD"
+        text original_transaction_id FK "nullable, returns only"
+        uuid batch_id FK
         bigint line_total_paise
-        bool is_return "quantity below 0"
+        bool is_return
+        timestamptz created_at
     }
     IMPORT_ROW_ERROR {
         bigint id PK
+        uuid batch_id FK
         int row_number
         text column_name
         text message
-        text transaction_id
+        text transaction_id "nullable, not a foreign key"
     }
 ```
 
-Constraints in the schema back up the service-layer rules:
-- unique keys on `transactions.transaction_id`, `import_batches.file_sha256`, `stores.code`, `products.sku` and `(sku, alias_name)`;
-- non-negative money;
-- `quantity <> 0`;
-- `is_return = (quantity < 0)`.
+**Constraints in the schema** back up the service-layer rules:
 
-The exact DDL is in `backend/migrations/`.
+| Kind | Constraints |
+| --- | --- |
+| Primary keys | `stores.code`, `products.sku`, `product_aliases.id`, `import_batches.id`, `import_payloads.batch_id` (at most one payload per batch), `import_row_errors.id`, `transactions.transaction_id` |
+| Unique | `import_batches.file_sha256` (file idempotency, rule 1) · `product_aliases (sku, alias_name)` · `import_row_errors (batch_id, row_number)` |
+| Foreign keys | `transactions.store_code → stores` · `transactions.sku → products` · `transactions.batch_id → import_batches` · `transactions.original_transaction_id → transactions` · `product_aliases.sku → products` · `import_row_errors.batch_id → import_batches` · `import_payloads.batch_id → import_batches` |
+| CHECK on `transactions` | `quantity <> 0` · `unit_price_paise >= 0` · `discount_paise >= 0` · `payment_mode IN ('CASH', 'UPI', 'CARD')` · `is_return = (quantity < 0)` |
+| CHECK elsewhere | `import_batches.status IN ('QUEUED', 'PROCESSING', 'COMPLETED', 'REJECTED_HEADER', 'FAILED')` · `import_row_errors.row_number >= 2` (row 1 is the header) · `import_payloads.received_size_bytes >= 0` |
+| Defaults | Timestamps `uploaded_at`, `created_at` and `first_seen_at` default to `now()`; row counts and `attempt_count` default to 0 |
+
+**Stored vs. derived:**
+- **Derived, not stored:** the batch's error-report link (`/api/v1/imports/{id}/errors.csv`), the dashboard figures (computed with SQL on each request) and the money as rupees (computed from paise).
+- **Stored on purpose:** `line_total_paise` and `is_return`, kept consistent with `quantity` by the CHECK above.
+- **Not a foreign key:** `import_row_errors.transaction_id`, because a rejected row's transaction is never stored.
+- **Indexes:** besides the primary keys and unique constraints, no secondary indexes exist yet (see §11).
 
 ### 4.5 Folder structure
 
@@ -372,7 +421,7 @@ All paths are under the API base URL. Interactive docs: [`/docs`](https://kjbn-s
 | --- | --- | --- | --- |
 | GET | `/health` | Liveness | — |
 | GET | `/health/db` | Database reachability | 503 |
-| POST | `/api/v1/imports` | Upload 1–10 sales CSVs (multipart field `files`). Each file's extension and size are checked, then it is hashed and queued; rows import in the background. **202** if anything was queued · **200** if every file was already uploaded · **400** if no file was usable. Per-file results in the body | 400 (too many files, no usable file) · 422 (no files) · 429 (rate limit, with `Retry-After`) · 503 |
+| POST | `/api/v1/imports` | Upload 1–10 sales CSVs (multipart field `files`). Each file's extension and size are checked, then it is hashed and queued; rows import in the background. **202** if anything was queued. If nothing was queued: **400** if any file was invalid, otherwise **200** (every file was already uploaded). Per-file results in the body | 400 (too many files, no usable file) · 422 (no files) · 429 (rate limit, with `Retry-After`) · 503 |
 | GET | `/api/v1/imports?limit=&offset=` | Batch history, newest first: counts, status, error-report link. `limit ≤ 100` | 422 · 503 |
 | GET | `/api/v1/imports/{batch_id}/errors.csv` | Streamed CSV of a batch's rejected rows: `row_number, column_name, message, transaction_id` | 404 · 422 (bad UUID) · 503 |
 | GET | `/api/v1/transactions` | Search: `store_code`, `sku` (exact), `date_from` / `date_to` (IST days, inclusive), `returns_only`, `page`, `limit ≤ 100`. Returns `total` and `pages` | 422 (bad values, `date_from` after `date_to`) · 503 |
@@ -401,7 +450,57 @@ All paths are under the API base URL. Interactive docs: [`/docs`](https://kjbn-s
 
 **Worked example (rule 5):** `2 × 540.00 − 40.00` is computed as `2 × 54000 − 4000 = 104000` paise and returned as `{"paise": 104000, "rupees": "1040.00"}`. The matching return, `−1 × 540.00 − 0`, gives `−54000`. No floats are involved at any step: `parse_paise` turns the text `540.00` into `54000` with exact decimal arithmetic.
 
-### 8.2 Edge cases from the problem statement
+### 8.2 How one row is checked
+
+Each row goes through the checks below in this order and stops at the first failure. That failure becomes one row error (row number, column, message) in `import_row_errors`, which feeds the batch's counts and its error CSV. Each rule code is reported against one column (`COLUMN_BY_CODE` in `sales_rules.py`). A row with the wrong number of fields is reported against the column `__row__`.
+
+```mermaid
+flowchart TD
+    IN["CSV row, values trimmed"] --> S1["1 · Shape (csv_parser.validate_row)<br/>exactly 10 fields, else a whole-row error<br/>every required value present, else the first missing column"]
+    S1 --> S2["2 · Order (sales_importer.processing_order)<br/>pass 1: all sales · pass 2: all returns<br/>each pass oldest sold_at first"]
+    S2 --> S3["3 · Duplicates (sales_importer.accept_row)<br/>DUPLICATE_IN_FILE · DUPLICATE_IN_DATABASE"]
+    S3 --> S4["4 · Formats (sales_rules.parse_sale_row)<br/>INVALID_SOLD_AT · INVALID_QUANTITY<br/>INVALID_UNIT_PRICE · INVALID_DISCOUNT"]
+    S4 --> S5["5 · Store exists<br/>UNKNOWN_STORE"]
+    S5 --> S6["6 · Every row (sales_rules.validate_sale)<br/>INVALID_QUANTITY (zero) · INVALID_PAYMENT_MODE · FUTURE_TIMESTAMP<br/>INVALID_UNIT_PRICE / INVALID_DISCOUNT (negative)<br/>AMOUNT_TOO_LARGE · DISCOUNT_EXCEEDS_GROSS"]
+    S6 --> Q{"Positive quantity?"}
+    Q -- "yes: a sale" --> S7["7a · Sale<br/>SALE_HAS_ORIGINAL"]
+    Q -- "no: a return" --> S8["7b · Return (sales_rules.validate_return)<br/>RETURN_DISCOUNT_NOT_ZERO · RETURN_ORIGINAL_REQUIRED<br/>RETURN_ORIGINAL_NOT_FOUND · RETURN_ORIGINAL_NOT_A_SALE<br/>RETURN_BEFORE_SALE · RETURN_STORE_MISMATCH<br/>RETURN_SKU_MISMATCH · RETURN_QUANTITY_EXCEEDS_ORIGINAL"]
+    S7 --> OK["Accepted: added to the insert plan.<br/>Later rows see it as a duplicate ID,<br/>a return's original, or in a return total"]
+    S8 --> OK
+    S1 & S3 & S4 & S5 & S6 & S7 & S8 -. "first failure" .-> REJ["Rejected: one row error<br/>row number · column · message"]
+```
+
+Because sales are planned before returns, a return can refer to a sale listed further down the same file.
+
+### 8.3 Concurrent imports
+
+Two imports that return the last unit of the same sale at the same time are serialised by a row lock. `sales_importer.load_import_state` locks the original sales with `SELECT … FOR UPDATE`, and only then reads how much of each was already returned:
+
+```mermaid
+sequenceDiagram
+    participant A as Import A (return R1 of sale T1)
+    participant DB as PostgreSQL
+    participant B as Import B (return R2 of sale T1)
+
+    Note over DB: T1 sold 1 unit, none returned yet
+    A->>DB: SELECT T1 FOR UPDATE (lock taken)
+    A->>DB: units already returned against T1 = 0
+    B->>DB: SELECT T1 FOR UPDATE
+    Note over B,DB: B waits, because A holds the lock on T1
+    A->>A: R1 returns 1 of 1, accepted
+    A->>DB: INSERT R1, COMMIT (lock released)
+    DB-->>B: lock granted
+    B->>DB: units already returned against T1 = 1
+    B->>B: R2 would make 2 of 1, rejected (quantity)
+    B->>DB: INSERT the row error, COMMIT
+```
+
+- **Batch outcome:** both batches complete. B reports its row as `RETURN_QUANTITY_EXCEEDS_ORIGINAL`, so returns can never exceed the sale.
+- **No deadlocks:** locks are always taken in `transaction_id` order, so two imports can't lock in opposite orders.
+- **The other race:** two files importing the same new `transaction_id` at once. Inserts use `ON CONFLICT DO NOTHING`; if a row was skipped, that import rolls back to its savepoint, re-reads the conflicting keys and plans again. The repeated ID then becomes `DUPLICATE_IN_DATABASE` while its other rows still import.
+- **Tests:** both races are covered against real PostgreSQL, in `test_concurrent_imports.py::test_concurrent_returns_of_last_unit_only_one_succeeds` and `::test_overlapping_id_rejects_only_the_duplicate_and_keeps_new_rows`.
+
+### 8.4 Edge cases from the problem statement
 
 | Edge case | Result | Test / sample |
 | --- | --- | --- |
@@ -414,7 +513,7 @@ All paths are under the API base URL. Interactive docs: [`/docs`](https://kjbn-s
 | Quantity 0 | Rejected | `test_sales_rules.py::test_zero_quantity_is_rejected` |
 | Date range with no data | Zeros and empty lists, no errors | `test_api_dashboard.py::test_range_without_any_sales_returns_zeros_without_errors` |
 
-### 8.3 Assumptions (ambiguities I resolved)
+### 8.5 Assumptions (ambiguities I resolved)
 
 1. **Time zone.** `sold_at` in the CSV is IST. It is stored in UTC and shown in IST. Dashboard and search ranges are IST calendar days, inclusive at both ends.
 2. **"Not in the future"** is judged against the server clock at import time (or the `X-Test-Clock` time). A `sold_at` exactly equal to "now" is accepted.
@@ -427,7 +526,7 @@ All paths are under the API base URL. Interactive docs: [`/docs`](https://kjbn-s
 9. **The original** must be a sale, not another return.
 10. **Duplicate IDs within one file** are decided in `sold_at` order: the earliest copy is kept and later copies are rejected. If the first copy was itself rejected, a later valid copy can be accepted.
 11. **File identity** is the SHA-256 of the bytes. The same rows saved with different line endings are a different file; their rows are then rejected individually as duplicates (rule 1b).
-12. **Re-uploading a header-rejected file** reports `ALREADY UPLOADED`. A file that failed for a database reason is retried when uploaded again (3 attempts in total).
+12. **Retries.** A database error during an import is retried automatically, up to 3 attempts in total. Re-uploading a file whose batch ended `FAILED` queues it again. Re-uploading any other already-processed file, including a header-rejected one, only reports `ALREADY UPLOADED`.
 13. **Product names.** The first name seen for a SKU wins. Each different later name is stored once as an alias. A product row is only created by an accepted row.
 14. **Revenue is net:** the sum of line totals, so returns subtract.
 15. **Return rate** is units returned ÷ units sold for each store in the range; 0 when nothing was sold.
@@ -435,6 +534,7 @@ All paths are under the API base URL. Interactive docs: [`/docs`](https://kjbn-s
 17. **Payment-mode split** covers sales only (how customers paid), so shares are never negative and add up to 100 %.
 18. **No date range** on the dashboard means everything up to today (IST). The UI defaults to "This month".
 19. **Transaction search** filters (`sku`, `store_code`) are exact matches, not substrings.
+20. **Spaces and case in values.** Every value is trimmed of surrounding spaces before validation (header names are not trimmed, see 4). Payment mode is case-insensitive: `upi` is accepted and stored as `UPI`.
 
 ## 9. Error handling and logging
 
@@ -467,7 +567,7 @@ All paths are under the API base URL. Interactive docs: [`/docs`](https://kjbn-s
 
 **Data consistency:** each batch imports in one transaction. A failure at any point, even after thousands of rows were inserted, leaves nothing behind.
 
-**UI:** errors show the API's message and request ID with a Retry button. Every page has loading and empty states.
+**UI:** errors show the API's message and request ID, and failed data loads offer a Retry button. Every page has loading and empty states.
 
 ### 9.3 Logging
 
@@ -478,7 +578,7 @@ Structured JSON, one object per line, on stdout. Common fields: `timestamp`, `le
 | INFO | Each completed request | `method`, `status_code`, `duration_ms` |
 | INFO | Each imported batch | `batch_id`, `file_name`, `rows_total`, `rows_accepted`, `rows_rejected` |
 | WARNING | Rows rejected by validation or rules (one line per batch) | The batch fields above, plus `rejected_by_column` (e.g. `{"quantity": 12, "store_code": 3}`) and `examples` (the first 5 rejected rows: row, column, transaction ID, reason) |
-| WARNING | A batch rejected for its header or encoding, or a failed attempt that will be retried | `batch_id`, `file_name`, `status`; `attempt`, `max_attempts`, `will_retry` |
+| WARNING | A batch rejected for its header or encoding, or a failed import attempt (retried or given up) | `batch_id`, `file_name`, `status`; `attempt`, `max_attempts`, `will_retry` |
 | ERROR with traceback | Unexpected exceptions, database outages, failed imports | `batch_id`, `file_name` where relevant |
 
 - **Correlation:** the request ID comes from `X-Request-ID` if it is a safe value; otherwise one is generated. It is echoed in the response header and the error body, and attached to every log line of that request, **including the background import it starts**.
@@ -527,7 +627,7 @@ curl -s "$API/api/v1/transactions?limit=abc" | jq
 | `sample_bad_rows.csv` | Row-level errors (unknown store, wrong date format, …) |
 | `sample_bad_header.csv` | Whole-file rejection (missing `payment_mode` column) |
 | `sample_bom_crlf.csv` | BOM and CRLF line endings |
-| `sample_edge_cases.csv` | Boundaries and formatting: discount equal to gross, zero price, `23:59:59` and `00:00:00`, quoted commas, padded values, lowercase payment mode (rejected), a second name for a SKU (becomes an alias) |
+| `sample_edge_cases.csv` | Boundaries and formatting: 11 accepted, 1 rejected. Accepted: discount equal to gross (line total 0), zero price, `23:59:59` and `00:00:00`, quoted commas, padded values, lowercase `upi`, prices without decimals (`25`) or with one (`399.5`); two new names for `SKU-114` become aliases. Rejected: a return with a non-zero discount |
 | `sample_21k.csv` | 21,000 rows |
 | `stores_100.csv` | A 100-store catalog for `POST /api/v1/stores` |
 
@@ -552,14 +652,14 @@ None of these breaks a Core rule; they are trade-offs or gaps worth knowing abou
 
 | Area | Limitation |
 | --- | --- |
-| Interrupted imports | Imports run as a FastAPI background task in the web process, not in a separate worker. If the process restarts mid-import, nothing is lost (the transaction rolls back), but the batch stays `PROCESSING` until it counts as stale (1 hour). It is then retried when the same file is re-uploaded, or when `python -m app.services.csv_validator --worker --once` runs |
+| Interrupted imports | Imports run as a FastAPI background task in the web process, not in a separate worker. If the process restarts mid-import, nothing is lost (the transaction rolls back), but the batch stays `PROCESSING` until it counts as stale (1 hour). After that it is picked up by the next upload that queues any file (each upload's background task drains every claimable batch), or by `python -m app.services.csv_validator --worker --once`. Re-uploading the stuck file itself only reports `ALREADY UPLOADED` |
 | Retry budget | Attempts never reset: a batch that failed all 3 attempts gets only one more try when re-uploaded |
 | Rate limiting | In memory, per process: it resets on restart and isn't shared across instances |
 | Upload result timing | The upload response shows each file's status (queued, already uploaded, invalid) immediately. Accepted/rejected counts and the error-report link appear in the batch history when the background import finishes (seconds; the page refreshes while a batch is in flight) |
 | Memory | Uploads are read whole into memory (capped at 10 MB per file, 10 files per request) and stored gzipped until imported; they are not streamed |
 | Indexes | `transactions` has no secondary indexes on `sold_at`, `store_code`, `original_transaction_id` or `batch_id`. At ~25k rows queries are fast but scan the table; larger volumes would need them |
 | Undo | A completed batch can't be deleted or rolled back from the UI or API |
-| Exact-match text | Product names are compared exactly (`Basmati Rice 5kg` vs. `Basmati Rice 5 kg` gives a name plus an alias). Payment modes are case-sensitive: `upi` is rejected, as `sample_edge_cases.csv` shows |
+| Exact-match names | Product names are compared exactly after trimming, so `Basmati Rice 5kg` and `Basmati Rice 5 kg` give a name plus an alias rather than one product |
 | Batch history filter | The filter box searches only the page of batches currently loaded, not all batches |
 | Test clock | Off on the hosted instance; use it locally |
 | Free tiers | The API sleeps when idle (first request 30–60 s) and Neon suspends; both wake automatically |
