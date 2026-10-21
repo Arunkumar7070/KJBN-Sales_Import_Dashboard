@@ -14,7 +14,7 @@ from app.config import get_settings
 from app.database import Base, get_db
 from app.main import app
 from app.models import ImportBatch, ImportRowError, Store, Transaction
-from app.services import csv_validator
+from app.services import csv_validator, import_worker
 
 REAL_NOW = datetime(2026, 10, 19, 6, 30, tzinfo=UTC)  # 12:00 IST on the 19th.
 HEADER = (
@@ -93,7 +93,7 @@ def session_factory(monkeypatch):
     with factory() as session:
         session.add(Store(code="ST01", name="Store One", city="Chennai"))
         session.commit()
-    monkeypatch.setattr(csv_validator, "SessionLocal", factory)  # Background worker.
+    monkeypatch.setattr(import_worker, "SessionLocal", factory)  # Background worker.
     yield factory
     engine.dispose()
 

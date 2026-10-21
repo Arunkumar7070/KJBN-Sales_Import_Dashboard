@@ -17,10 +17,11 @@ import pytest
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import sessionmaker
 
+from app import clock
 from app.config import Settings
 from app.database import Base
 from app.models import ImportBatch, ImportRowError, Product, Store, Transaction
-from app.services import csv_validator
+from app.services import csv_validator, import_worker, sales_importer
 
 TEST_POSTGRES_URL = os.environ.get("TEST_POSTGRES_URL")
 pytestmark = pytest.mark.skipif(
@@ -46,8 +47,8 @@ def postgres(monkeypatch):
     engine = base_engine.execution_options(schema_translate_map={None: schema})
     Base.metadata.create_all(engine)
     factory = sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(csv_validator, "SessionLocal", factory)
-    monkeypatch.setattr(csv_validator, "utc_now", lambda: FIXED_NOW)
+    monkeypatch.setattr(import_worker, "SessionLocal", factory)
+    monkeypatch.setattr(clock, "utc_now", lambda: FIXED_NOW)
     try:
         yield factory, base_engine
     finally:
@@ -122,7 +123,7 @@ def test_concurrent_returns_of_last_unit_only_one_succeeds(
     # lock on T1) until import B is seen blocked on that lock.
     a_holds_lock = threading.Event()
     release_a = threading.Event()
-    real_load = csv_validator.load_import_state
+    real_load = sales_importer.load_import_state
 
     def load_then_pause_in_a(session, rows):
         state = real_load(session, rows)
@@ -131,7 +132,7 @@ def test_concurrent_returns_of_last_unit_only_one_succeeds(
             release_a.wait(LOCK_WAIT_TIMEOUT_SECONDS)
         return state
 
-    monkeypatch.setattr(csv_validator, "load_import_state", load_then_pause_in_a)
+    monkeypatch.setattr(sales_importer, "load_import_state", load_then_pause_in_a)
 
     exit_codes = {}
 
@@ -219,7 +220,7 @@ def test_overlapping_id_rejects_only_the_duplicate_and_keeps_new_rows(
     # A's uncommitted rows until A commits.
     a_inserted = threading.Event()
     release_a = threading.Event()
-    real_import_rows = csv_validator.import_rows
+    real_import_rows = sales_importer.import_rows
 
     def import_then_pause_in_a(*args, **kwargs):
         outcome = real_import_rows(*args, **kwargs)
@@ -228,7 +229,7 @@ def test_overlapping_id_rejects_only_the_duplicate_and_keeps_new_rows(
             release_a.wait(LOCK_WAIT_TIMEOUT_SECONDS)
         return outcome
 
-    monkeypatch.setattr(csv_validator, "import_rows", import_then_pause_in_a)
+    monkeypatch.setattr(sales_importer, "import_rows", import_then_pause_in_a)
 
     exit_codes = {}
 

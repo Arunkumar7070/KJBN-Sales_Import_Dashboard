@@ -19,7 +19,7 @@ from app.database import Base, get_db
 from app.logging_config import JsonFormatter, current_request_id, request_context
 from app.main import app
 from app.models import Store
-from app.services import csv_validator
+from app.services import import_worker, sales_importer
 
 CSV_HEADER = (
     "transaction_id,store_code,sold_at,sku,product_name,quantity,"
@@ -51,7 +51,7 @@ def session_factory(monkeypatch):
     with factory() as session:
         session.add(Store(code="ST01", name="Store One", city="Chennai"))
         session.commit()
-    monkeypatch.setattr(csv_validator, "SessionLocal", factory)
+    monkeypatch.setattr(import_worker, "SessionLocal", factory)
     yield factory
     engine.dispose()
 
@@ -189,7 +189,7 @@ def test_background_import_logs_carry_the_upload_request_id(
     def broken_lookup(*args, **kwargs):
         raise OperationalError("SELECT", {}, Exception("connection lost"))
 
-    monkeypatch.setattr(csv_validator, "load_import_state", broken_lookup)
+    monkeypatch.setattr(sales_importer, "load_import_state", broken_lookup)
     rows = "T1,ST01,2026-10-17 09:00:00,SKU1,Masala Chai,1,100.00,0,UPI,\n"
 
     response = client.post(

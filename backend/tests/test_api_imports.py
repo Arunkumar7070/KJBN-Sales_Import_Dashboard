@@ -12,11 +12,12 @@ from sqlalchemy.pool import StaticPool
 
 from api import routes
 from api.routes import RateLimiter
+from app import clock as app_clock
 from app.config import get_settings
 from app.database import Base, get_db
 from app.main import app
 from app.models import ImportBatch, ImportPayload, ImportRowError, Store, Transaction
-from app.services import csv_validator
+from app.services import import_worker
 
 FIXED_NOW = datetime(2026, 10, 17, 12, 0, tzinfo=UTC)
 HEADER = (
@@ -54,8 +55,8 @@ def session_factory(monkeypatch):
     with factory() as session:
         session.add(Store(code="ST01", name="Store One", city="Chennai"))
         session.commit()
-    monkeypatch.setattr(csv_validator, "SessionLocal", factory)  # Worker side.
-    monkeypatch.setattr(csv_validator, "utc_now", lambda: FIXED_NOW)
+    monkeypatch.setattr(import_worker, "SessionLocal", factory)  # Worker side.
+    monkeypatch.setattr(app_clock, "utc_now", lambda: FIXED_NOW)
     yield factory
     engine.dispose()
 

@@ -1,13 +1,16 @@
 import gzip
 import hashlib
 import os
+import uuid
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import sessionmaker
 
+from app import clock
 from app.config import Settings
 from app.database import Base
 from app.models import (
@@ -19,13 +22,15 @@ from app.models import (
     Store,
     Transaction,
 )
-from app.services import csv_validator
+from app.services import import_worker, sales_importer
 from app.services.csv_validator import (
     CsvRow,
+    ImportState,
     RowError,
     check_csv_file,
     enqueue_upload,
     main,
+    plan_import,
     processing_order,
     register_import_batch,
     run_next_batch,
@@ -80,8 +85,8 @@ def session_factory(monkeypatch):
             ]
         )
         session.commit()
-    monkeypatch.setattr(csv_validator, "SessionLocal", factory)
-    monkeypatch.setattr(csv_validator, "utc_now", lambda: FIXED_NOW)
+    monkeypatch.setattr(import_worker, "SessionLocal", factory)
+    monkeypatch.setattr(clock, "utc_now", lambda: FIXED_NOW)
     yield factory
     engine.dispose()
 
@@ -573,7 +578,7 @@ def test_cli_reports_database_failure_cleanly(tmp_path, capsys, monkeypatch):
     def unavailable():
         raise OperationalError("connect", {}, Exception("password=secret"))
 
-    monkeypatch.setattr(csv_validator, "SessionLocal", unavailable)
+    monkeypatch.setattr(import_worker, "SessionLocal", unavailable)
     path = write_file(tmp_path, "sales.csv")
 
     exit_code = main([str(path)])
@@ -831,6 +836,12 @@ def test_valid_sale_is_saved_with_converted_values(tmp_path, session_factory):
     assert saved.batch_id == batch.id
 
 
+def test_lowercase_payment_mode_is_saved_uppercase(tmp_path, session_factory):
+    import_csv(tmp_path, [row_with(payment_mode="upi")])
+
+    assert saved_transactions(session_factory)["T1"].payment_mode == "UPI"
+
+
 def test_batch_counts_and_status_after_import(tmp_path, session_factory):
     rows = [
         row_with(transaction_id="T1"),
@@ -956,9 +967,9 @@ def test_id_already_in_database_is_rejected(tmp_path, session_factory):
             "discount (₹200.01) exceeds the line amount (₹200.00).",
         ),
         (
-            {"payment_mode": "upi"},
+            {"payment_mode": "NETBANKING"},
             "payment_mode",
-            "payment_mode must be CASH, UPI or CARD; got 'upi'.",
+            "payment_mode must be CASH, UPI or CARD; got 'NETBANKING'.",
         ),
         ({"store_code": "ST99"}, "store_code", "Store code 'ST99' does not exist."),
         (
@@ -973,7 +984,7 @@ def test_id_already_in_database_is_rejected(tmp_path, session_factory):
         "non-integer-quantity",
         "negative-price",
         "discount-over-amount",
-        "lowercase-payment-mode",
+        "unknown-payment-mode",
         "unknown-store",
         "sale-with-original",
     ],
@@ -1381,7 +1392,7 @@ def test_database_failure_saves_nothing_and_marks_batch_failed(
     def broken_lookup(*args, **kwargs):
         raise OperationalError("SELECT", {}, Exception("connection lost"))
 
-    monkeypatch.setattr(csv_validator, "load_import_state", broken_lookup)
+    monkeypatch.setattr(sales_importer, "load_import_state", broken_lookup)
 
     exit_code = import_csv(tmp_path, [ROW, row_with(transaction_id="T2", sku="")])
 
@@ -1401,14 +1412,14 @@ def test_database_failure_saves_nothing_and_marks_batch_failed(
 def test_uploading_a_failed_file_again_retries_it(
     tmp_path, session_factory, monkeypatch
 ):
-    real_lookup = csv_validator.load_import_state
+    real_lookup = sales_importer.load_import_state
 
     def broken_lookup(*args, **kwargs):
         raise OperationalError("SELECT", {}, Exception("connection lost"))
 
-    monkeypatch.setattr(csv_validator, "load_import_state", broken_lookup)
+    monkeypatch.setattr(sales_importer, "load_import_state", broken_lookup)
     import_csv(tmp_path, [ROW])
-    monkeypatch.setattr(csv_validator, "load_import_state", real_lookup)
+    monkeypatch.setattr(sales_importer, "load_import_state", real_lookup)
 
     exit_code = import_csv(tmp_path, [ROW])
 
@@ -1469,7 +1480,7 @@ def test_stale_lookup_conflict_rejects_only_that_row(
     # day1 commits SHARED and creates SKU1. day2's lookups are then made stale,
     # as if day1 committed between day2's lookup and its INSERTs.
     import_csv(tmp_path, [row_with(transaction_id="SHARED")], name="day1.csv")
-    real_load = csv_validator.load_import_state
+    real_load = sales_importer.load_import_state
 
     def stale_load(session, rows):
         state = real_load(session, rows)
@@ -1477,7 +1488,7 @@ def test_stale_lookup_conflict_rejects_only_that_row(
         state.product_names.clear()
         return state
 
-    monkeypatch.setattr(csv_validator, "load_import_state", stale_load)
+    monkeypatch.setattr(sales_importer, "load_import_state", stale_load)
 
     exit_code = import_csv(
         tmp_path,
@@ -1507,6 +1518,319 @@ def test_stale_lookup_conflict_rejects_only_that_row(
             "SHARED",
         )
     ]
+
+
+# In-memory planning (phase 1 of an import)
+
+PLAN_BATCH_ID = uuid.UUID(int=1)
+
+
+def lookups(**changes):
+    """An ImportState as load_import_state would return it: ST01 exists, no data."""
+    state = ImportState(
+        existing_transaction_ids=set(),
+        store_codes={"ST01"},
+        product_names={},
+        aliases=set(),
+        originals={},
+        returned_quantity=Counter(),
+    )
+    for name, value in changes.items():
+        setattr(state, name, value)
+    return state
+
+
+def plan_rows(rows, state=None, row_errors=()):
+    csv_rows = [
+        CsvRow(row_number, dict(zip(HEADER, row, strict=True)))
+        for row_number, row in enumerate(rows, start=2)
+    ]
+    return plan_import(
+        csv_rows,
+        list(row_errors),
+        state if state is not None else lookups(),
+        PLAN_BATCH_ID,
+        lambda: FIXED_NOW,
+    )
+
+
+def test_plan_collects_rows_new_products_and_aliases_without_a_database():
+    plan = plan_rows(
+        [
+            row_with(transaction_id="T1"),
+            row_with(transaction_id="T2", product_name="Chai 250g"),
+            row_with(transaction_id="T3", product_name="Chai 250g"),
+        ]
+    )
+
+    assert [values["transaction_id"] for values in plan.transactions] == [
+        "T1",
+        "T2",
+        "T3",
+    ]
+    assert plan.transactions[0] == {
+        "transaction_id": "T1",
+        "store_code": "ST01",
+        "sold_at": datetime(2026, 10, 17, 3, 30, tzinfo=UTC),  # 09:00 IST
+        "sku": "SKU1",
+        "product_name": "Masala Chai",
+        "quantity": 2,
+        "unit_price_paise": 10000,
+        "discount_paise": 0,
+        "payment_mode": "UPI",
+        "original_transaction_id": None,
+        "batch_id": PLAN_BATCH_ID,
+        "line_total_paise": 20000,
+        "is_return": False,
+    }
+    # The first name creates the product; a new name becomes one alias, once.
+    assert plan.products == [{"sku": "SKU1", "name": "Masala Chai"}]
+    assert plan.aliases == [{"sku": "SKU1", "alias_name": "Chai 250g"}]
+    assert plan.row_errors == []
+
+
+def test_plan_known_product_and_alias_are_not_planned_again():
+    plan = plan_rows(
+        [
+            row_with(transaction_id="T1"),
+            row_with(transaction_id="T2", product_name="Chai"),
+        ],
+        lookups(product_names={"SKU1": "Masala Chai"}, aliases={("SKU1", "Chai")}),
+    )
+
+    assert (plan.products, plan.aliases) == ([], [])
+    assert len(plan.transactions) == 2
+
+
+def test_plan_second_pass_finds_originals_and_caps_cumulative_returns():
+    plan = plan_rows(
+        [
+            a_return("R1", "2026-10-17 10:00:00"),  # Listed above its sale.
+            a_return("R2", "2026-10-17 10:30:00"),
+            a_return("R3", "2026-10-17 11:00:00"),  # Would be the 3rd of 2 units.
+            row_with(transaction_id="T1"),
+        ]
+    )
+
+    assert [values["transaction_id"] for values in plan.transactions] == [
+        "T1",
+        "R1",
+        "R2",
+    ]
+    assert [values["is_return"] for values in plan.transactions] == [False, True, True]
+    assert [
+        (e.row_number, e.column_name, e.transaction_id) for e in plan.row_errors
+    ] == [(4, "quantity", "R3")]
+
+
+def test_plan_rejects_duplicates_and_keeps_file_errors_in_row_order():
+    file_error = RowError(3, "sku", "Missing required value(s): sku.")
+    plan = plan_rows(
+        [
+            row_with(transaction_id="OLD"),  # row 2: already in the database
+            row_with(transaction_id="T1"),  # row 3 is the file error above
+            row_with(transaction_id="T1"),  # row 4: duplicate of row 3's ID
+            row_with(transaction_id="T2", store_code="ST99"),  # row 5
+        ],
+        lookups(existing_transaction_ids={"OLD"}),
+        row_errors=[file_error],
+    )
+
+    assert [(e.row_number, e.column_name) for e in plan.row_errors] == [
+        (2, "transaction_id"),
+        (3, "sku"),
+        (4, "transaction_id"),
+        (5, "store_code"),
+    ]
+    assert plan.row_errors[1] is file_error
+    assert [values["transaction_id"] for values in plan.transactions] == ["T1"]
+
+
+def test_planning_does_not_change_the_lookups_so_it_can_run_again():
+    state = lookups()
+    rows = [row_with(transaction_id="T1"), a_return("R1", "2026-10-17 10:00:00")]
+
+    first = plan_rows(rows, state)
+    second = plan_rows(rows, state)
+
+    assert state == lookups()
+    assert first == second
+    assert len(first.transactions) == 2
+
+
+def statements_while_importing(tmp_path, session_factory, rows, name):
+    """Every SQL statement sent to the database while importing `rows`."""
+    engine = session_factory.kw["bind"]
+    statements = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        import_csv(tmp_path, rows, name=name)
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    return statements
+
+
+def count_starting_with(statements, prefix):
+    return sum(statement.startswith(prefix) for statement in statements)
+
+
+def test_savepoints_do_not_grow_with_the_number_of_rows(tmp_path, session_factory):
+    one_row = statements_while_importing(
+        tmp_path, session_factory, [row_with(transaction_id="A1")], "one.csv"
+    )
+    many_rows = statements_while_importing(
+        tmp_path,
+        session_factory,
+        [row_with(transaction_id=f"B{n}") for n in range(50)],
+        "many.csv",
+    )
+
+    assert count_starting_with(many_rows, "SAVEPOINT") == count_starting_with(
+        one_row, "SAVEPOINT"
+    )
+    assert len(saved_transactions(session_factory)) == 51
+
+
+# Chunked inserts (phase 2 of an import)
+
+
+def test_rows_and_errors_are_inserted_in_chunks(tmp_path, session_factory, monkeypatch):
+    monkeypatch.setattr(sales_importer, "INSERT_CHUNK_SIZE", 2)
+    valid = [row_with(transaction_id=f"T{n}") for n in range(5)]
+    rejected = [row_with(transaction_id=f"X{n}", store_code="ST99") for n in range(3)]
+
+    statements = statements_while_importing(
+        tmp_path, session_factory, valid + rejected, "chunks.csv"
+    )
+
+    # 5 rows -> chunks of 2, 2 and 1; 3 errors -> 2 and 1; one new product.
+    assert count_starting_with(statements, "INSERT INTO transactions") == 3
+    assert count_starting_with(statements, "INSERT INTO import_row_errors") == 2
+    assert count_starting_with(statements, "INSERT INTO products") == 1
+    batch = batch_named(session_factory, "chunks.csv")
+    assert sorted(saved_transactions(session_factory)) == [f"T{n}" for n in range(5)]
+    assert [error[3] for error in saved_row_errors(session_factory, batch)] == [
+        "X0",
+        "X1",
+        "X2",
+    ]
+    assert (batch.status, batch.rows_accepted, batch.rows_rejected) == (
+        "COMPLETED",
+        5,
+        3,
+    )
+
+
+def test_a_chunk_of_exactly_the_chunk_size_is_one_insert(
+    tmp_path, session_factory, monkeypatch
+):
+    monkeypatch.setattr(sales_importer, "INSERT_CHUNK_SIZE", 4)
+
+    statements = statements_while_importing(
+        tmp_path,
+        session_factory,
+        [row_with(transaction_id=f"T{n}") for n in range(4)],
+        "exact.csv",
+    )
+
+    assert count_starting_with(statements, "INSERT INTO transactions") == 1
+    assert count_starting_with(statements, "INSERT INTO import_row_errors") == 0
+    assert len(saved_transactions(session_factory)) == 4
+
+
+def test_product_created_meanwhile_under_another_name_gets_an_alias(
+    tmp_path, session_factory, monkeypatch
+):
+    # day1 creates SKU1 as "Masala Chai"; day2's lookups miss it, as if day1
+    # committed after them. The skipped product insert makes day2 re-plan.
+    import_csv(tmp_path, [row_with(transaction_id="T1")], name="day1.csv")
+    real_load = sales_importer.load_import_state
+
+    def stale_load(session, rows):
+        state = real_load(session, rows)
+        state.product_names.clear()
+        state.aliases.clear()
+        return state
+
+    monkeypatch.setattr(sales_importer, "load_import_state", stale_load)
+
+    import_csv(
+        tmp_path,
+        [row_with(transaction_id="T2", product_name="Chai Latte")],
+        name="day2.csv",
+    )
+
+    assert saved_products(session_factory) == (
+        {"SKU1": "Masala Chai"},  # day1's name is kept.
+        [("SKU1", "Chai Latte")],
+    )
+    assert batch_named(session_factory, "day2.csv").status == "COMPLETED"
+
+
+def test_conflict_that_persists_fails_the_batch_and_saves_nothing(
+    tmp_path, session_factory, monkeypatch
+):
+    import_csv(tmp_path, [row_with(transaction_id="SHARED")], name="day1.csv")
+    real_load = sales_importer.load_import_state
+
+    def stale_load(session, rows):
+        state = real_load(session, rows)
+        state.existing_transaction_ids.clear()
+        return state
+
+    monkeypatch.setattr(sales_importer, "load_import_state", stale_load)
+    # The re-read never sees SHARED, so every attempt clashes again.
+    monkeypatch.setattr(
+        sales_importer, "refresh_conflicting_lookups", lambda session, state, plan: None
+    )
+
+    exit_code = import_csv(
+        tmp_path,
+        [
+            row_with(transaction_id="NEW"),
+            row_with(transaction_id="SHARED"),
+            row_with(transaction_id="BAD", store_code="ST99"),
+        ],
+        name="day2.csv",
+    )
+
+    day2 = batch_named(session_factory, "day2.csv")
+    assert exit_code == 1
+    assert day2.status == "FAILED"
+    assert sorted(saved_transactions(session_factory)) == ["SHARED"]  # day1 only
+    assert saved_row_errors(session_factory, day2) == []
+
+
+def test_failure_after_rows_were_inserted_rolls_back_the_whole_batch(
+    tmp_path, session_factory, monkeypatch
+):
+    real_insert_in_chunks = sales_importer.insert_in_chunks
+
+    def fail_on_row_errors(session, model, rows):
+        if model is ImportRowError:
+            raise OperationalError("INSERT", {}, Exception("connection lost"))
+        real_insert_in_chunks(session, model, rows)
+
+    monkeypatch.setattr(sales_importer, "insert_in_chunks", fail_on_row_errors)
+
+    exit_code = import_csv(
+        tmp_path,
+        [
+            row_with(transaction_id="T1"),
+            row_with(transaction_id="T2", store_code="ST99"),
+        ],
+    )
+
+    batch = only_batch(session_factory)
+    assert exit_code == 1
+    assert batch.status == "FAILED"
+    # T1 and its new product were inserted before the failure; both are gone.
+    assert saved_transactions(session_factory) == {}
+    assert saved_products(session_factory) == ({}, [])
 
 
 # Several files in one run
@@ -1596,14 +1920,14 @@ def test_unexpected_error_in_one_file_does_not_stop_the_others(
     good = write_file(
         tmp_path, "good.csv", csv_bytes(rows=[row_with(transaction_id="T2")])
     )
-    real_check = csv_validator.check_csv_file
+    real_check = import_worker.check_csv_file
 
     def crash_on_broken(path, max_size_bytes):
         if path.name == "broken.csv":
             raise RuntimeError("disk on fire")
         return real_check(path, max_size_bytes)
 
-    monkeypatch.setattr(csv_validator, "check_csv_file", crash_on_broken)
+    monkeypatch.setattr(import_worker, "check_csv_file", crash_on_broken)
 
     exit_code = main([str(broken), str(good)])
 
@@ -1623,7 +1947,7 @@ def test_database_down_reports_every_file_without_crashing(
     def unavailable():
         raise OperationalError("connect", {}, Exception("password=secret"))
 
-    monkeypatch.setattr(csv_validator, "SessionLocal", unavailable)
+    monkeypatch.setattr(import_worker, "SessionLocal", unavailable)
     first = write_file(
         tmp_path, "a.csv", csv_bytes(rows=[row_with(transaction_id="T1")])
     )
@@ -1660,7 +1984,7 @@ def staged_payloads(session_factory):
 
 def failing_lookups(times):
     """A load_import_state that raises a database error on its first `times` calls."""
-    real_load = csv_validator.load_import_state
+    real_load = sales_importer.load_import_state
     calls = {"count": 0}
 
     def load(session, rows):
@@ -1794,7 +2118,7 @@ def test_worker_fails_corrupt_payload(session_factory):
 def test_database_error_keeps_payload_and_next_run_retries(
     session_factory, monkeypatch
 ):
-    monkeypatch.setattr(csv_validator, "load_import_state", failing_lookups(times=1))
+    monkeypatch.setattr(sales_importer, "load_import_state", failing_lookups(times=1))
     enqueue(session_factory)
 
     first = run_next_batch()
@@ -1820,7 +2144,7 @@ def test_database_error_keeps_payload_and_next_run_retries(
 def test_worker_gives_up_after_max_attempts_and_reupload_requeues(
     session_factory, monkeypatch
 ):
-    monkeypatch.setattr(csv_validator, "load_import_state", failing_lookups(times=3))
+    monkeypatch.setattr(sales_importer, "load_import_state", failing_lookups(times=3))
     enqueue(session_factory)
 
     outcomes = [run_next_batch() for _ in range(4)]
@@ -1909,7 +2233,7 @@ def test_run_worker_drain_stops_cleanly_when_database_is_down(monkeypatch, capsy
     def unavailable():
         raise OperationalError("connect", {}, Exception("password=secret"))
 
-    monkeypatch.setattr(csv_validator, "SessionLocal", unavailable)
+    monkeypatch.setattr(import_worker, "SessionLocal", unavailable)
 
     outcomes = run_worker(drain=True)
 
@@ -1973,7 +2297,7 @@ def test_cli_worker_stops_cleanly_on_ctrl_c(monkeypatch, capsys):
     def interrupted(**kwargs):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(csv_validator, "run_worker", interrupted)
+    monkeypatch.setattr(import_worker, "run_worker", interrupted)
 
     assert main(["--worker"]) == 0
     assert capsys.readouterr().out == "Worker stopped.\n"

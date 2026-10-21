@@ -86,7 +86,7 @@ def parse_sale_row(values: Mapping[str, str]) -> SaleRow:
         quantity=parse_quantity(values["quantity"]),
         unit_price_paise=parse_paise(values["unit_price"], "INVALID_UNIT_PRICE"),
         discount_paise=parse_paise(values["discount"], "INVALID_DISCOUNT"),
-        payment_mode=values["payment_mode"],
+        payment_mode=values["payment_mode"].upper(),
         original_transaction_id=values["original_transaction_id"] or None,
     )
 

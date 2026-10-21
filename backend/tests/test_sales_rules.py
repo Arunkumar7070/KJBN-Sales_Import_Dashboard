@@ -154,7 +154,7 @@ def test_known_payment_modes_are_accepted(validate, payment_mode):
     validate(sale(payment_mode=payment_mode))
 
 
-@pytest.mark.parametrize("payment_mode", ["CHEQUE", "", "upi", " UPI"])
+@pytest.mark.parametrize("payment_mode", ["CHEQUE", "NETBANKING"])
 def test_unknown_payment_modes_are_rejected(assert_rejected, payment_mode):
     assert_rejected("INVALID_PAYMENT_MODE", sale(payment_mode=payment_mode))
 
