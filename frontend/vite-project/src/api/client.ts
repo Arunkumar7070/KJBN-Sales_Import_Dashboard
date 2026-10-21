@@ -128,15 +128,6 @@ export function listTransactions(
   return request(transactionsPath(filters, page, limit), { signal });
 }
 
-export async function checkDatabaseHealth(signal?: AbortSignal): Promise<boolean> {
-  try {
-    const response = await send("/health/db", { signal });
-    return response.ok;
-  } catch {
-    return false;
-  }
-}
-
 // Uploads (XMLHttpRequest, so the UI can show real upload progress)
 
 function uploadForm<T>(
