@@ -16,5 +16,24 @@ services:
       timeout: 5s
       retries: 10
 
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      # Local-only values, so no .env file is needed.
+      DATABASE_URL: postgresql://kjbn:kjbn@db:5432/kjbn
+      CORS_ALLOWED_ORIGINS: http://localhost:5173
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # The slim image has no curl; urlopen fails on any non-2xx response.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s  # Migrations and the seed run before the server starts.
+
 volumes:
   db-data:
