@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 import { formatIstClock } from "../lib/format";
-import { Icon } from "./ui";
+import { Icon, primaryButton } from "./ui";
+
+const API_DOCS_URL = "https://kjbn-sales-backend.onrender.com/docs#/";
 
 const NAV_ITEMS = [
   { to: "/", label: "Executive Analytics", icon: "analytics" },
@@ -103,6 +105,10 @@ function TopBar() {
           <Icon name="schedule" className="text-[16px] text-primary" />
           <span className="font-mono text-xs text-on-surface">{clock} IST</span>
         </div>
+        <a href={API_DOCS_URL} target="_blank" rel="noopener noreferrer" className={primaryButton} title="API Docs">
+          <Icon name="api" className="text-[16px]" />
+          <span className="hidden sm:inline">API Docs</span>
+        </a>
       </div>
     </header>
   );
